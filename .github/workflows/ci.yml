@@ -20,7 +20,7 @@ env:
 jobs:
   format:
     name: Format
-    runs-on: ubuntu-latest
+    runs-on: depot-ubuntu-24.04-4
     env:
       RUSTUP_TOOLCHAIN: nightly-2026-02-19
     steps:
@@ -41,7 +41,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-14]
+        os: [depot-ubuntu-24.04-16, namespace-profile-macos-15]
         release-channel: [nightly, stable]
     env:
       CFG_RELEASE_CHANNEL: ${{ matrix.release-channel }}
@@ -59,7 +59,7 @@ jobs:
 
   rustdoc:
     name: Rustdoc
-    runs-on: ubuntu-latest
+    runs-on: depot-ubuntu-24.04-4
     env:
       RUSTDOCFLAGS: >-
         --document-private-items --enable-index-page --show-type-layout
