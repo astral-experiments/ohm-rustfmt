@@ -41,7 +41,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [depot-ubuntu-24.04-16, namespace-profile-macos-15]
+        os: [depot-ubuntu-24.04-16, depot-macos-15]
         release-channel: [nightly, stable]
     env:
       CFG_RELEASE_CHANNEL: ${{ matrix.release-channel }}
