@@ -23,12 +23,13 @@ extern crate rustc_driver;
 
 use std::cell::RefCell;
 use std::cmp::min;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
+use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::mem;
 use std::panic;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use rustc_ast::ast;
@@ -40,6 +41,7 @@ use crate::emitter::Emitter;
 use crate::formatting::{FormatErrorMap, FormattingError, ReportedErrors, SourceFile};
 use crate::modules::ModuleResolutionError;
 use crate::parse::parser::DirectoryOwnership;
+use crate::parse::session::{FileProbe, ParseSess};
 use crate::shape::Indent;
 use crate::utils::indent_next_line;
 
@@ -441,6 +443,52 @@ pub struct Session<'b, T: Write> {
     pub(crate) errors: ReportedErrors,
     source_file: SourceFile,
     emitter: Box<dyn Emitter + 'b>,
+    module_graph: Option<ResolvedModuleGraph>,
+}
+
+/// Files actually selected by rustfmt's native module resolver for each input.
+struct ResolvedModuleGraph {
+    roots: BTreeMap<PathBuf, ResolvedRootFiles>,
+    complete: bool,
+}
+
+/// Distinguishes files actually formatted from every source loaded or probed by the parser.
+#[derive(Default)]
+struct ResolvedRootFiles {
+    files: BTreeSet<PathBuf>,
+    dependencies: BTreeSet<PathBuf>,
+    probes: BTreeMap<PathBuf, FileProbe>,
+}
+
+/// Versioned handoff consumed by incremental cargo-fmt after a successful formatter run.
+#[derive(serde::Serialize)]
+struct ModuleGraphManifest<'a> {
+    schema: &'static str,
+    version: u32,
+    roots: Vec<ModuleGraphRoot<'a>>,
+}
+
+#[derive(serde::Serialize)]
+struct ModuleGraphRoot<'a> {
+    path: &'a Path,
+    files: Vec<&'a Path>,
+    dependencies: Vec<&'a Path>,
+    probes: Vec<&'a FileProbe>,
+}
+
+/// Rejects unresolved and non-UTF-8 paths that cannot be represented in a cache manifest.
+fn canonical_graph_path(path: &Path) -> Option<PathBuf> {
+    let canonical = path.canonicalize().ok()?;
+    canonical.to_str().is_some().then_some(canonical)
+}
+
+/// Canonicalizes all native sources, failing the entire graph if any source is unavailable.
+fn canonical_graph_paths<'a>(
+    paths: impl Iterator<Item = Option<&'a Path>>,
+) -> Option<BTreeSet<PathBuf>> {
+    paths
+        .map(|path| path.and_then(canonical_graph_path))
+        .collect()
 }
 
 impl<'b, T: Write + 'b> Session<'b, T> {
@@ -457,6 +505,7 @@ impl<'b, T: Write + 'b> Session<'b, T> {
             emitter,
             errors: ReportedErrors::default(),
             source_file: SourceFile::new(),
+            module_graph: None,
         }
     }
 
@@ -464,6 +513,148 @@ impl<'b, T: Write + 'b> Session<'b, T> {
     /// given config. `out` is only necessary if required by the configuration.
     pub fn format(&mut self, input: Input) -> Result<FormatReport, ErrorKind> {
         self.format_input_inner(input, false)
+    }
+
+    /// Enables opt-in collection of the exact files selected for each input.
+    #[doc(hidden)]
+    pub fn enable_module_graph(&mut self) {
+        self.module_graph = Some(ResolvedModuleGraph {
+            roots: BTreeMap::new(),
+            complete: true,
+        });
+    }
+
+    pub(crate) fn module_graph_enabled(&self) -> bool {
+        self.module_graph.is_some()
+    }
+
+    /// Records formatted files, all parsed dependencies, and native resolution decisions.
+    ///
+    /// Any incomplete source, missing dependency probe, or conflicting observation disables
+    /// manifest publication for the entire formatter invocation.
+    pub(crate) fn record_module_graph<'a, 'd>(
+        &mut self,
+        root: &FileName,
+        files: impl Iterator<Item = &'a FileName>,
+        dependencies: impl Iterator<Item = Option<&'d Path>>,
+        probes: Option<Vec<FileProbe>>,
+    ) {
+        let Some(graph) = self.module_graph.as_mut() else {
+            return;
+        };
+        let FileName::Real(root) = root else {
+            graph.complete = false;
+            return;
+        };
+        let Some(root) = canonical_graph_path(root) else {
+            graph.complete = false;
+            return;
+        };
+        let Some(resolved_files) = canonical_graph_paths(files.map(|file| match file {
+            FileName::Real(path) => Some(path.as_path()),
+            _ => None,
+        })) else {
+            graph.complete = false;
+            return;
+        };
+        let Some(loaded_dependencies) = canonical_graph_paths(dependencies) else {
+            graph.complete = false;
+            return;
+        };
+
+        let Some(probes) = probes else {
+            graph.complete = false;
+            return;
+        };
+        let mut resolved_probes = BTreeMap::new();
+        let mut observed_dependencies = BTreeSet::new();
+        for probe in probes {
+            if !probe.path.is_absolute()
+                || probe.path.to_str().is_none()
+                || probe.exists != probe.canonical.is_some()
+                || (!probe.exists && probe.is_directory)
+                || probe
+                    .canonical
+                    .as_ref()
+                    .is_some_and(|path| !path.is_absolute() || path.to_str().is_none())
+            {
+                graph.complete = false;
+                return;
+            }
+            if let Some(canonical) = &probe.canonical {
+                observed_dependencies.insert(canonical.clone());
+            }
+            if resolved_probes.insert(probe.path.clone(), probe).is_some() {
+                graph.complete = false;
+                return;
+            }
+        }
+
+        if !resolved_files.contains(&root)
+            || !resolved_files.is_subset(&loaded_dependencies)
+            || !loaded_dependencies.is_subset(&observed_dependencies)
+        {
+            graph.complete = false;
+            return;
+        }
+        let resolved = graph.roots.entry(root).or_default();
+        resolved.files.extend(resolved_files);
+        resolved.dependencies.extend(loaded_dependencies);
+        for (path, probe) in resolved_probes {
+            if let Some(previous) = resolved.probes.insert(path, probe.clone()) {
+                if previous != probe {
+                    graph.complete = false;
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Atomically publishes only a complete graph containing exactly the requested roots.
+    #[doc(hidden)]
+    pub fn write_module_manifest(&self, path: &Path, expected_roots: &[PathBuf]) -> io::Result<()> {
+        let Some(graph) = self.module_graph.as_ref().filter(|graph| graph.complete) else {
+            return Err(io::Error::other("the rustfmt module graph is incomplete"));
+        };
+
+        let roots = expected_roots
+            .iter()
+            .map(fs::canonicalize)
+            .collect::<io::Result<BTreeSet<_>>>()?;
+        if roots.len() != graph.roots.len()
+            || roots.iter().any(|root| !graph.roots.contains_key(root))
+        {
+            return Err(io::Error::other("the rustfmt module graph is incomplete"));
+        }
+
+        let manifest = ModuleGraphManifest {
+            schema: "ohm.rustfmt-files",
+            version: 1,
+            roots: graph
+                .roots
+                .iter()
+                .map(|(root, resolved)| ModuleGraphRoot {
+                    path: root,
+                    files: resolved.files.iter().map(PathBuf::as_path).collect(),
+                    dependencies: resolved.dependencies.iter().map(PathBuf::as_path).collect(),
+                    probes: resolved.probes.values().collect(),
+                })
+                .collect(),
+        };
+        let temporary = path.with_extension(format!("{}.tmp", std::process::id()));
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)?;
+        let result = (|| {
+            serde_json::to_writer(&mut file, &manifest).map_err(io::Error::other)?;
+            file.flush()?;
+            fs::rename(&temporary, path)
+        })();
+        if result.is_err() {
+            let _ = fs::remove_file(&temporary);
+        }
+        result
     }
 
     pub fn override_config<F, U>(&mut self, mut config: Config, f: F) -> U
@@ -555,13 +746,14 @@ impl Input {
         }
     }
 
-    fn to_directory_ownership(&self) -> Option<DirectoryOwnership> {
+    fn to_directory_ownership(&self, parse_session: &ParseSess) -> Option<DirectoryOwnership> {
         match self {
             Input::File(ref file) => {
                 // If there exists a directory with the same name as an input,
                 // then the input should be parsed as a sub module.
                 let file_stem = file.file_stem()?;
-                if file.parent()?.to_path_buf().join(file_stem).is_dir() {
+                let directory = file.parent()?.to_path_buf().join(file_stem);
+                if parse_session.file_exists(&directory) && directory.is_dir() {
                     Some(DirectoryOwnership::Owned {
                         relative: file_stem.to_str().map(symbol::Ident::from_str),
                     })
@@ -577,6 +769,285 @@ impl Input {
 #[cfg(test)]
 mod unit_tests {
     use super::*;
+
+    #[test]
+    fn module_manifest_records_canonical_sorted_files_for_each_root() -> io::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let first_root = directory.path().join("first.rs");
+        let second_root = directory.path().join("second.rs");
+        let shared_module = directory.path().join("shared.rs");
+        for path in [&first_root, &second_root, &shared_module] {
+            fs::write(path, "fn formatted() {}\n")?;
+        }
+
+        let mut output = Vec::new();
+        let mut session = Session::new(Config::default(), Some(&mut output));
+        session.enable_module_graph();
+        session.record_module_graph(
+            &FileName::Real(second_root.clone()),
+            [
+                FileName::Real(shared_module.clone()),
+                FileName::Real(second_root.clone()),
+            ]
+            .iter(),
+            [&second_root, &shared_module]
+                .into_iter()
+                .map(|path| Some(path.as_path())),
+            Some(vec![
+                FileProbe {
+                    path: second_root.clone(),
+                    canonical: Some(second_root.canonicalize()?),
+                    exists: true,
+                    is_directory: false,
+                },
+                FileProbe {
+                    path: shared_module.clone(),
+                    canonical: Some(shared_module.canonicalize()?),
+                    exists: true,
+                    is_directory: false,
+                },
+            ]),
+        );
+        session.record_module_graph(
+            &FileName::Real(first_root.clone()),
+            [
+                FileName::Real(shared_module.clone()),
+                FileName::Real(first_root.clone()),
+            ]
+            .iter(),
+            [&first_root, &shared_module]
+                .into_iter()
+                .map(|path| Some(path.as_path())),
+            Some(vec![
+                FileProbe {
+                    path: first_root.clone(),
+                    canonical: Some(first_root.canonicalize()?),
+                    exists: true,
+                    is_directory: false,
+                },
+                FileProbe {
+                    path: shared_module.clone(),
+                    canonical: Some(shared_module.canonicalize()?),
+                    exists: true,
+                    is_directory: false,
+                },
+            ]),
+        );
+
+        let manifest_path = directory.path().join("modules.json");
+        session.write_module_manifest(&manifest_path, &[second_root, first_root.clone()])?;
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&fs::read(manifest_path)?).map_err(io::Error::other)?;
+
+        assert_eq!(manifest["schema"], "ohm.rustfmt-files");
+        assert_eq!(manifest["version"], 1);
+        assert_eq!(
+            manifest["roots"][0]["path"],
+            first_root.canonicalize()?.to_string_lossy().as_ref()
+        );
+        assert_eq!(
+            manifest["roots"][0]["files"].as_array().map(Vec::len),
+            Some(2)
+        );
+        assert_eq!(
+            manifest["roots"][0]["dependencies"]
+                .as_array()
+                .map(Vec::len),
+            Some(2)
+        );
+        assert_eq!(
+            manifest["roots"][0]["probes"].as_array().map(Vec::len),
+            Some(2)
+        );
+        assert_eq!(manifest["roots"].as_array().map(Vec::len), Some(2));
+        Ok(())
+    }
+
+    #[test]
+    fn successful_write_mode_publishes_actual_resolved_module_graph() -> io::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let root = directory.path().join("root.rs");
+        let external = directory.path().join("external.rs");
+        let parsed = directory.path().join("parsed.rs");
+        let skipped = directory.path().join("skipped.rs");
+        fs::write(
+            &root,
+            concat!(
+                "#[path = \"external.rs\"]\nmod external;\nmod parsed;\n",
+                "#[rustfmt::skip]\nmod skipped;\nfn root( ){ }\n",
+            ),
+        )?;
+        fs::write(&external, "fn external( ){ }\n")?;
+        fs::write(&parsed, "#![rustfmt::skip]\nfn parsed( ){ }\n")?;
+        fs::write(&skipped, "fn skipped( {{{\n")?;
+
+        let mut configuration = Config::default();
+        configuration.set().emit_mode(EmitMode::Files);
+        let mut output = Vec::new();
+        let mut session = Session::new(configuration, Some(&mut output));
+        session.enable_module_graph();
+        session
+            .format(Input::File(root.clone()))
+            .map_err(io::Error::other)?;
+
+        assert!(session.has_no_errors());
+        assert_eq!(fs::read_to_string(&external)?, "fn external() {}\n");
+        assert_eq!(
+            fs::read_to_string(&parsed)?,
+            "#![rustfmt::skip]\nfn parsed( ){ }\n"
+        );
+        assert_eq!(fs::read_to_string(&skipped)?, "fn skipped( {{{\n");
+        let manifest_path = directory.path().join("modules.json");
+        session.write_module_manifest(&manifest_path, &[root])?;
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&fs::read(manifest_path)?).map_err(io::Error::other)?;
+        let files = manifest["roots"][0]["files"]
+            .as_array()
+            .ok_or_else(|| io::Error::other("module files missing"))?;
+        let dependencies = manifest["roots"][0]["dependencies"]
+            .as_array()
+            .ok_or_else(|| io::Error::other("module dependencies missing"))?;
+        let probes = manifest["roots"][0]["probes"]
+            .as_array()
+            .ok_or_else(|| io::Error::other("module probes missing"))?;
+        let parsed_path = parsed.canonicalize()?;
+        let skipped_path = skipped.canonicalize()?;
+        let alternate_parsed_path = directory.path().join("parsed/mod.rs");
+
+        assert_eq!(files.len(), 2);
+        assert_eq!(dependencies.len(), 3);
+        assert!(
+            !files
+                .iter()
+                .any(|file| file.as_str() == parsed_path.to_str())
+        );
+        assert!(
+            dependencies
+                .iter()
+                .any(|file| file.as_str() == parsed_path.to_str())
+        );
+        assert!(
+            !dependencies
+                .iter()
+                .any(|file| file.as_str() == skipped_path.to_str())
+        );
+        assert!(probes.iter().any(|probe| {
+            probe["exists"] == true
+                && probe["is_directory"] == false
+                && probe["canonical"].as_str() == parsed_path.to_str()
+        }));
+        assert!(probes.iter().any(|probe| {
+            probe["exists"] == false
+                && probe["is_directory"] == false
+                && probe["canonical"].is_null()
+                && probe["path"].as_str() == alternate_parsed_path.to_str()
+        }));
+        assert!(
+            probes
+                .iter()
+                .all(|probe| { probe["canonical"].as_str() != skipped_path.to_str() })
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn module_manifest_preserves_logical_symlink_probes() -> io::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let root = directory.path().join("root.rs");
+        let first = directory.path().join("first.rs");
+        let second = directory.path().join("second.rs");
+        let linked = directory.path().join("linked.rs");
+        fs::write(&root, "#[path = \"linked.rs\"]\nmod linked;\n")?;
+        fs::write(&first, "fn first() {}\n")?;
+        fs::write(&second, "fn second() {}\n")?;
+        std::os::unix::fs::symlink(&first, &linked)?;
+
+        for (index, expected) in [&first, &second].into_iter().enumerate() {
+            if index == 1 {
+                fs::remove_file(&linked)?;
+                std::os::unix::fs::symlink(&second, &linked)?;
+            }
+
+            let mut output = Vec::new();
+            let mut session = Session::new(Config::default(), Some(&mut output));
+            session.enable_module_graph();
+            session
+                .format(Input::File(root.clone()))
+                .map_err(io::Error::other)?;
+            let manifest_path = directory.path().join(format!("modules-{index}.json"));
+            session.write_module_manifest(&manifest_path, std::slice::from_ref(&root))?;
+            let manifest: serde_json::Value =
+                serde_json::from_slice(&fs::read(manifest_path)?).map_err(io::Error::other)?;
+            let probes = manifest["roots"][0]["probes"]
+                .as_array()
+                .ok_or_else(|| io::Error::other("module probes missing"))?;
+            let canonical = expected.canonicalize()?;
+
+            assert!(probes.iter().any(|probe| {
+                probe["path"].as_str() == linked.to_str()
+                    && probe["exists"] == true
+                    && probe["is_directory"] == false
+                    && probe["canonical"].as_str() == canonical.to_str()
+            }));
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn benign_macro_fallback_does_not_invalidate_complete_module_manifest() -> io::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let root = directory.path().join("root.rs");
+        fs::write(&root, "fn formatted() {}\n")?;
+
+        let mut output = Vec::new();
+        let mut session = Session::new(Config::default(), Some(&mut output));
+        session.enable_module_graph();
+        session
+            .format(Input::File(root.clone()))
+            .map_err(io::Error::other)?;
+        session.errors.has_macro_format_failure = true;
+        assert!(!session.has_no_errors());
+
+        let manifest_path = directory.path().join("modules.json");
+        session.write_module_manifest(&manifest_path, &[root])?;
+        assert!(manifest_path.is_file());
+        Ok(())
+    }
+
+    #[test]
+    fn incomplete_module_manifest_is_never_published() -> io::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let root = directory.path().join("root.rs");
+        let module = directory.path().join("module.rs");
+        fs::write(&root, "mod module;\n")?;
+        fs::write(&module, "fn formatted() {}\n")?;
+
+        let mut output = Vec::new();
+        let mut session = Session::new(Config::default(), Some(&mut output));
+        session.enable_module_graph();
+        session.record_module_graph(
+            &FileName::Real(root.clone()),
+            [FileName::Real(module)].iter(),
+            [root.as_path()].into_iter().map(Some),
+            Some(vec![FileProbe {
+                path: root.clone(),
+                canonical: Some(root.canonicalize()?),
+                exists: true,
+                is_directory: false,
+            }]),
+        );
+
+        let manifest_path = directory.path().join("modules.json");
+        assert!(
+            session
+                .write_module_manifest(&manifest_path, &[root])
+                .is_err()
+        );
+        assert!(!manifest_path.exists());
+        Ok(())
+    }
 
     #[test]
     fn test_no_panic_on_format_snippet_and_format_code_block() {

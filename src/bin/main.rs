@@ -23,6 +23,7 @@ use crate::rustfmt::{
 };
 
 const BUG_REPORT_URL: &str = "https://github.com/rust-lang/rustfmt/issues/new?labels=bug";
+const MODULE_MANIFEST_ENVIRONMENT: &str = "OHM_RUSTFMT_MODULE_MANIFEST";
 
 // N.B. these crates are loaded from the sysroot, so they need extern crate.
 extern crate rustc_driver;
@@ -344,6 +345,11 @@ fn format(
 
     let out = &mut stdout();
     let mut session = Session::new(config, Some(out));
+    let module_manifest = env::var_os(MODULE_MANIFEST_ENVIRONMENT).map(PathBuf::from);
+    let expected_roots = module_manifest.as_ref().map(|_| files.clone());
+    if module_manifest.is_some() {
+        session.enable_module_graph();
+    }
 
     for file in files {
         if !file.exists() {
@@ -392,6 +398,13 @@ fn format(
     } else {
         0
     };
+    if let (0, Some(path), Some(roots)) = (exit_code, module_manifest, expected_roots) {
+        // Missing or unwritable manifests make consumers fall back to complete
+        // formatting. They must never change rustfmt's diagnostics or status.
+        // Some macro rewrites intentionally fail silently without affecting
+        // rustfmt's successful public exit status.
+        let _ = session.write_module_manifest(&path, &roots);
+    }
     Ok(exit_code)
 }
 
