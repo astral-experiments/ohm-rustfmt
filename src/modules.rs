@@ -517,7 +517,9 @@ impl<'ast, 'psess, 'c> ModResolver<'ast, 'psess> {
 
                     // In the case where there is an x.rs and an ./x directory we want
                     // to prevent adding x twice. For example, ./x/x
-                    if self.directory.path.exists() && !self.directory.path.join(id).exists() {
+                    if self.psess.file_exists(&self.directory.path)
+                        && !self.psess.file_exists(&self.directory.path.join(id))
+                    {
                         return;
                     }
                 }
@@ -542,7 +544,7 @@ impl<'ast, 'psess, 'c> ModResolver<'ast, 'psess> {
         for path in path_visitor.paths() {
             let mut actual_path = self.directory.path.clone();
             actual_path.push(&path);
-            if !actual_path.exists() {
+            if !self.psess.file_exists(&actual_path) {
                 continue;
             }
             if self.psess.is_file_parsed(&actual_path) {

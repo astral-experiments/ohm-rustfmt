@@ -1,6 +1,8 @@
-use std::path::Path;
-use std::sync::Arc;
+use std::collections::BTreeMap;
+use std::io;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use rustc_data_structures::sync::IntoDynSyncSend;
 use rustc_errors::annotate_snippet_emitter_writer::AnnotateSnippetEmitter;
@@ -8,8 +10,8 @@ use rustc_errors::emitter::{DynEmitter, Emitter, SilentEmitter, stderr_destinati
 use rustc_errors::{ColorConfig, Diag, DiagCtxt, DiagInner, Level as DiagnosticLevel};
 use rustc_session::parse::ParseSess as RawParseSess;
 use rustc_span::{
-    BytePos, Span,
-    source_map::{FilePathMapping, SourceMap},
+    BytePos, SourceFileHashAlgorithm, Span,
+    source_map::{FileLoader, FilePathMapping, RealFileLoader, SourceMap, SourceMapInputs},
     symbol,
 };
 
@@ -27,6 +29,105 @@ pub(crate) struct ParseSess {
     raw_psess: RawParseSess,
     ignore_path_set: Arc<IgnorePathSet>,
     can_reset_errors: Arc<AtomicBool>,
+    file_probes: Option<Arc<RecordedFileProbes>>,
+}
+
+/// One filesystem observation made by rustfmt's real module resolver.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
+pub(crate) struct FileProbe {
+    pub(crate) path: PathBuf,
+    pub(crate) canonical: Option<PathBuf>,
+    pub(crate) exists: bool,
+    pub(crate) is_directory: bool,
+}
+
+/// Collects logical parser paths and invalidates the graph when observations disagree.
+struct RecordedFileProbes {
+    current_directory: PathBuf,
+    probes: Mutex<BTreeMap<PathBuf, FileProbe>>,
+    complete: AtomicBool,
+}
+
+impl RecordedFileProbes {
+    fn new() -> io::Result<Self> {
+        Ok(Self {
+            current_directory: RealFileLoader.current_directory()?,
+            probes: Mutex::new(BTreeMap::new()),
+            complete: AtomicBool::new(true),
+        })
+    }
+
+    /// Preserves symlink aliases and negative lookups while rejecting unstable observations.
+    fn record(&self, path: &Path, exists: bool) {
+        let path = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            self.current_directory.join(path)
+        };
+        if path.to_str().is_none() {
+            self.complete.store(false, Ordering::Release);
+            return;
+        }
+
+        let canonical = if exists {
+            match path.canonicalize() {
+                Ok(canonical) if canonical.to_str().is_some() => Some(canonical),
+                _ => {
+                    self.complete.store(false, Ordering::Release);
+                    return;
+                }
+            }
+        } else {
+            None
+        };
+        let probe = FileProbe {
+            path: path.clone(),
+            canonical,
+            exists,
+            is_directory: exists && path.is_dir(),
+        };
+        match self.probes.lock() {
+            Ok(mut probes) => match probes.get(&path) {
+                Some(previous) if previous != &probe => {
+                    self.complete.store(false, Ordering::Release);
+                }
+                Some(_) => {}
+                None => {
+                    probes.insert(path, probe);
+                }
+            },
+            Err(_) => self.complete.store(false, Ordering::Release),
+        }
+    }
+}
+
+/// Records native parser probes without changing the real loader's behavior.
+struct RecordingFileLoader {
+    probes: Arc<RecordedFileProbes>,
+}
+
+impl FileLoader for RecordingFileLoader {
+    fn file_exists(&self, path: &Path) -> bool {
+        let exists = RealFileLoader.file_exists(path);
+        self.probes.record(path, exists);
+        exists
+    }
+
+    fn read_file(&self, path: &Path) -> io::Result<String> {
+        let contents = RealFileLoader.read_file(path)?;
+        self.probes.record(path, true);
+        Ok(contents)
+    }
+
+    fn read_binary_file(&self, path: &Path) -> io::Result<Arc<[u8]>> {
+        let contents = RealFileLoader.read_binary_file(path)?;
+        self.probes.record(path, true);
+        Ok(contents)
+    }
+
+    fn current_directory(&self) -> io::Result<PathBuf> {
+        RealFileLoader.current_directory()
+    }
 }
 
 /// Emit errors against every files expect ones specified in the `ignore_path_set`.
@@ -117,12 +218,28 @@ fn default_dcx(
 }
 
 impl ParseSess {
-    pub(crate) fn new(config: &Config) -> Result<ParseSess, ErrorKind> {
+    pub(crate) fn new(config: &Config, record_file_probes: bool) -> Result<ParseSess, ErrorKind> {
         let ignore_path_set = match IgnorePathSet::from_ignore_list(&config.ignore()) {
             Ok(ignore_path_set) => Arc::new(ignore_path_set),
             Err(e) => return Err(ErrorKind::InvalidGlobPattern(e)),
         };
-        let source_map = Arc::new(SourceMap::new(FilePathMapping::empty()));
+        let file_probes = if record_file_probes {
+            Some(Arc::new(RecordedFileProbes::new()?))
+        } else {
+            None
+        };
+        let source_map = Arc::new(if let Some(probes) = &file_probes {
+            SourceMap::with_inputs(SourceMapInputs {
+                file_loader: Box::new(RecordingFileLoader {
+                    probes: Arc::clone(probes),
+                }),
+                path_mapping: FilePathMapping::empty(),
+                hash_kind: SourceFileHashAlgorithm::Md5,
+                checksum_hash_kind: None,
+            })
+        } else {
+            SourceMap::new(FilePathMapping::empty())
+        });
         let can_reset_errors = Arc::new(AtomicBool::new(false));
 
         let dcx = default_dcx(
@@ -138,7 +255,23 @@ impl ParseSess {
             raw_psess,
             ignore_path_set,
             can_reset_errors,
+            file_probes,
         })
+    }
+
+    /// Routes resolver existence decisions through the native source-map loader.
+    pub(crate) fn file_exists(&self, path: &Path) -> bool {
+        self.raw_psess.source_map().file_exists(path)
+    }
+
+    /// Returns native resolution decisions only when every recorded probe stayed consistent.
+    pub(crate) fn file_probes(&self) -> Option<Vec<FileProbe>> {
+        let recorded = self.file_probes.as_ref()?;
+        if !recorded.complete.load(Ordering::Acquire) {
+            return None;
+        }
+        let probes = recorded.probes.lock().ok()?;
+        Some(probes.values().cloned().collect())
     }
 
     /// Determine the submodule path for the given module identifier.
