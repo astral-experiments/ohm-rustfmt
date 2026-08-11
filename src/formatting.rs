@@ -1,6 +1,8 @@
 // High level formatting functions.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
+use std::fs;
 use std::io::{self, Write};
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -18,7 +20,7 @@ use crate::parse::parser::{DirectoryOwnership, Parser, ParserError};
 use crate::parse::session::{FileProbe, ParseSess};
 use crate::utils::{contains_skip, count_newlines};
 use crate::visitor::FmtVisitor;
-use crate::{ErrorKind, FormatReport, Input, Session, modules, source_file};
+use crate::{ErrorKind, FormatReport, Input, NewlineStyle, Session, modules, source_file};
 
 mod generated;
 mod newline_style;
@@ -55,6 +57,172 @@ impl<'b, T: Write + 'b> Session<'b, T> {
             })
         })
     }
+
+    /// Preserves root attributes and configuration while formatting one known leaf.
+    pub(crate) fn format_leaf_input(
+        &mut self,
+        root: &Path,
+        leaf: &Path,
+        expected_topology: Option<&str>,
+    ) -> Result<Option<(FormatReport, String, bool)>, ErrorKind> {
+        if !self.config.version_meets_requirement() {
+            return Err(ErrorKind::VersionMismatch);
+        }
+        if self.config.disable_all_formatting() {
+            return Ok(None);
+        }
+
+        rustc_span::create_session_if_not_set_then(self.config.edition().into(), |_| {
+            let configuration = self.config.clone();
+            let report = format_leaf_project(root, leaf, expected_topology, &configuration, self)?;
+            if let Some((report, _, _)) = report.as_ref() {
+                self.errors.add(&report.internal.borrow().1);
+            }
+            Ok(report)
+        })
+    }
+}
+
+/// Parses the real root and selected module without traversing unrelated siblings.
+fn format_leaf_project<T: FormatHandler>(
+    root: &Path,
+    leaf: &Path,
+    expected_topology: Option<&str>,
+    config: &Config,
+    handler: &mut T,
+) -> Result<Option<(FormatReport, String, bool)>, ErrorKind> {
+    if !preflight_direct_module(root, leaf, expected_topology, config)? {
+        return Ok(None);
+    }
+
+    let psess = ParseSess::new(config, false)?;
+    let mut report = FormatReport::new();
+    let krate = match Parser::parse_crate(Input::File(root.to_owned()), &psess) {
+        Ok(krate) => krate,
+        Err(_) => {
+            report.add_parsing_error();
+            return Ok(Some((report, String::new(), psess.emitted_diagnostics())));
+        }
+    };
+    let (attributes, items, span) =
+        match Parser::parse_file_as_module(&psess, leaf, krate.spans.inner_span) {
+            Ok(module) => module,
+            Err(_) => {
+                report.add_parsing_error();
+                return Ok(Some((report, String::new(), psess.emitted_diagnostics())));
+            }
+        };
+    let module = Module::new(
+        span,
+        Some(Cow::Owned(ast::ModKind::Unloaded)),
+        Cow::Owned(items),
+        Cow::Owned(attributes),
+    );
+    let Some(topology) = direct_root_module_topology(&krate, root, leaf, &module) else {
+        return Ok(None);
+    };
+    if expected_topology != Some(topology.as_str()) {
+        return Ok(None);
+    }
+
+    let root_file = FileName::Real(root.to_owned());
+    let leaf_file = FileName::Real(leaf.to_owned());
+    let mut context = FormatContext::new(&krate, report, psess, config, handler);
+    if should_skip_module(config, &context, false, &root_file, &leaf_file, &module) {
+        return Ok(None);
+    }
+
+    context.psess.set_silent_emitter();
+    if !context.format_file(leaf_file, &module, false, true)? {
+        return Ok(None);
+    }
+    let emitted_diagnostics = context.psess.emitted_diagnostics();
+    Ok(Some((context.report, topology, emitted_diagnostics)))
+}
+
+/// Checks speculative ownership without writing files or duplicating parser diagnostics.
+fn preflight_direct_module(
+    root: &Path,
+    leaf: &Path,
+    expected_topology: Option<&str>,
+    config: &Config,
+) -> Result<bool, ErrorKind> {
+    let mut configuration = config.clone();
+    configuration.set().show_parse_errors(false);
+    let psess = ParseSess::new(&configuration, false)?;
+    let Ok(krate) = Parser::parse_crate(Input::File(root.to_owned()), &psess) else {
+        return Ok(false);
+    };
+    let Ok((attributes, items, span)) =
+        Parser::parse_file_as_module(&psess, leaf, krate.spans.inner_span)
+    else {
+        return Ok(false);
+    };
+    if psess.emitted_diagnostics() {
+        return Ok(false);
+    }
+
+    let module = Module::new(
+        span,
+        Some(Cow::Owned(ast::ModKind::Unloaded)),
+        Cow::Owned(items),
+        Cow::Owned(attributes),
+    );
+    Ok(direct_root_module_topology(&krate, root, leaf, &module).as_deref() == expected_topology)
+}
+
+/// Requires an unannotated direct declaration with ordinary, unambiguous ownership.
+fn direct_root_module_topology(
+    krate: &ast::Crate,
+    root: &Path,
+    leaf: &Path,
+    module: &Module<'_>,
+) -> Option<String> {
+    let topology = modules::module_topology(module)?;
+    let directory = root.parent()?;
+    let canonical_directory = directory.canonicalize().ok()?;
+    let canonical_leaf = leaf.canonicalize().ok()?;
+
+    let direct = krate.items.iter().any(|item| {
+        if !item.attrs.is_empty() {
+            return false;
+        }
+        let ast::ItemKind::Mod(_, _, kind) = &item.kind else {
+            return false;
+        };
+        if !matches!(kind, ast::ModKind::Unloaded) {
+            return false;
+        }
+        let Some(name) = item.kind.ident() else {
+            return false;
+        };
+        let filename = format!("{name}.rs");
+        let module_directory = name.to_string();
+        let candidates = [
+            (
+                directory.join(&filename),
+                canonical_directory.join(&filename),
+            ),
+            (
+                directory.join(&module_directory).join("mod.rs"),
+                canonical_directory.join(&module_directory).join("mod.rs"),
+            ),
+        ];
+        let matches = candidates
+            .iter()
+            .filter_map(|(candidate, logical)| {
+                candidate
+                    .canonicalize()
+                    .ok()
+                    .map(|canonical| (logical, canonical))
+            })
+            .collect::<Vec<_>>();
+        matches.len() == 1
+            && matches.first().is_some_and(|(logical, canonical)| {
+                logical.as_path() == canonical.as_path() && canonical == &canonical_leaf
+            })
+    });
+    direct.then_some(topology)
 }
 
 /// Determine if a module should be skipped. True if the module should be skipped, false otherwise.
@@ -151,6 +319,12 @@ fn format_project<T: FormatHandler>(
     context.handler.record_module_graph(
         &main_file,
         files.iter().map(|(path, _)| path),
+        files.iter().filter_map(|(file, module)| {
+            let (FileName::Real(root), FileName::Real(path)) = (&main_file, file) else {
+                return None;
+            };
+            direct_root_module_topology(&krate, root, path, module).map(|topology| (file, topology))
+        }),
         loaded_sources.iter().map(|source| match &source.name {
             rustc_span::FileName::Real(path) => path.local_path(),
             _ => None,
@@ -169,7 +343,7 @@ fn format_project<T: FormatHandler>(
             return echo_back_stdin(context.psess.snippet_provider(module.span).entire_snippet());
         }
         should_emit_verbose(input_is_stdin, config, || println!("Formatting {}", path));
-        context.format_file(path, &module, is_macro_def)?;
+        context.format_file(path, &module, is_macro_def, false)?;
     }
     timer = timer.done_formatting();
 
@@ -220,7 +394,8 @@ impl<'a, T: FormatHandler + 'a> FormatContext<'a, T> {
         path: FileName,
         module: &Module<'_>,
         is_macro_def: bool,
-    ) -> Result<(), ErrorKind> {
+        require_unchanged: bool,
+    ) -> Result<bool, ErrorKind> {
         let snippet_provider = self.psess.snippet_provider(module.span);
         let mut visitor = FmtVisitor::from_psess(
             &self.psess,
@@ -259,6 +434,32 @@ impl<'a, T: FormatHandler + 'a> FormatContext<'a, T> {
             snippet_provider.entire_snippet(),
         );
 
+        if require_unchanged {
+            let errors = &self.report.internal.borrow().1;
+            let has_visible_errors = errors.has_operational_errors
+                || errors.has_parsing_errors
+                || errors.has_formatting_errors
+                || errors.has_check_errors
+                || errors.has_diff
+                || errors.has_unformatted_code_errors;
+            let unchanged = if self.config.newline_style() == NewlineStyle::Auto {
+                self.psess
+                    .get_original_snippet(&path)
+                    .map(|original| original.as_str() == visitor.buffer.as_str())
+            } else {
+                None
+            }
+            .unwrap_or_else(|| match &path {
+                FileName::Real(path) => {
+                    fs::read_to_string(path).is_ok_and(|original| original == visitor.buffer)
+                }
+                FileName::Stdin => false,
+            });
+            if has_visible_errors || self.psess.emitted_diagnostics() || !unchanged {
+                return Ok(false);
+            }
+        }
+
         if visitor.macro_rewrite_failure {
             self.report.add_macro_format_failure();
         }
@@ -270,7 +471,8 @@ impl<'a, T: FormatHandler + 'a> FormatContext<'a, T> {
             path,
             visitor.buffer.to_owned(),
             &mut self.report,
-        )
+        )?;
+        Ok(true)
     }
 }
 
@@ -280,10 +482,11 @@ trait FormatHandler {
     fn module_graph_enabled(&self) -> bool;
 
     /// Reports formatted files separately from all parser-loaded sources and resolver probes.
-    fn record_module_graph<'a, 'd>(
+    fn record_module_graph<'a, 'l, 'd>(
         &mut self,
         root: &FileName,
         files: impl Iterator<Item = &'a FileName>,
+        leaves: impl Iterator<Item = (&'l FileName, String)>,
         dependencies: impl Iterator<Item = Option<&'d Path>>,
         probes: Option<Vec<FileProbe>>,
     );
@@ -302,14 +505,15 @@ impl<'b, T: Write + 'b> FormatHandler for Session<'b, T> {
         Session::module_graph_enabled(self)
     }
 
-    fn record_module_graph<'a, 'd>(
+    fn record_module_graph<'a, 'l, 'd>(
         &mut self,
         root: &FileName,
         files: impl Iterator<Item = &'a FileName>,
+        leaves: impl Iterator<Item = (&'l FileName, String)>,
         dependencies: impl Iterator<Item = Option<&'d Path>>,
         probes: Option<Vec<FileProbe>>,
     ) {
-        Session::record_module_graph(self, root, files, dependencies, probes);
+        Session::record_module_graph(self, root, files, leaves, dependencies, probes);
     }
 
     // Called for each formatted file.
