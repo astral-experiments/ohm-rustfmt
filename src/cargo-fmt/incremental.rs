@@ -860,6 +860,13 @@ impl Snapshot {
                     Entry::Occupied(entry) => *entry.get(),
                     Entry::Vacant(entry) => {
                         let (_, metadata) = canonical_module_file(&path)?;
+                        observed_probes
+                            .entry(path.clone())
+                            .or_insert_with(|| ProbeObservation {
+                                canonical: Some(path.clone()),
+                                exists: true,
+                                is_directory: false,
+                            });
                         *entry.insert(SourceFingerprint::from_metadata(&metadata)?)
                     }
                 };
@@ -1140,8 +1147,10 @@ fn read_module_manifest(path: &Path) -> io::Result<ModuleManifest> {
     if !metadata.file_type().is_file() {
         return Err(unsupported("the module manifest is not a regular file"));
     }
-    let file = File::open(path)?;
-    serde_json::from_reader(file).map_err(io::Error::other)
+    let mut file = File::open(path)?;
+    let mut contents = Vec::new();
+    file.read_to_end(&mut contents)?;
+    serde_json::from_slice(&contents).map_err(io::Error::other)
 }
 
 fn canonical_module_path(path: &str) -> io::Result<PathBuf> {
@@ -2968,6 +2977,61 @@ mod tests {
         )?;
 
         assert!(read_module_manifests(&[manifest], &targets).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn snapshots_preserve_canonical_sources_and_distinct_resolution_probes() -> io::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let package = directory.path().canonicalize()?;
+        let root = package.join("lib.rs");
+        let module = package.join("module.rs");
+        let missing = package.join("missing.rs");
+        let nested = package.join("nested");
+        fs::write(&root, "mod module;")?;
+        fs::write(&module, "pub fn module() {}")?;
+        fs::create_dir(&nested)?;
+
+        let root_path = path_string(&root)?;
+        let module_path = path_string(&module)?;
+        let mut expected = [&root, &module, &missing]
+            .into_iter()
+            .map(|path| {
+                let path = path_string(path)?;
+                Ok((path.clone(), observe_module_probe(&path)?))
+            })
+            .collect::<io::Result<BTreeMap<_, _>>>()?;
+        let logical = path_string(&nested.join("..").join("module.rs"))?;
+        expected.insert(logical.clone(), observe_module_probe(&logical)?);
+
+        #[cfg(unix)]
+        {
+            let alias = package.join("alias.rs");
+            std::os::unix::fs::symlink(&module, &alias)?;
+            let alias = path_string(&alias)?;
+            expected.insert(alias.clone(), observe_module_probe(&alias)?);
+        }
+
+        let snapshot = Snapshot::capture(
+            &BTreeSet::from([target(&root, &package)]),
+            &[],
+            None,
+            &ModuleGraph::from([(
+                root_path.clone(),
+                BTreeSet::from([root_path.clone(), module_path]),
+            )]),
+            &LeafGraph::new(),
+            &ProbeGraph::from([(root_path.clone(), expected.clone())]),
+            Some("canonical-source-probes"),
+        )?;
+
+        assert_eq!(
+            snapshot
+                .packages
+                .get(&path_string(&package)?)
+                .and_then(|package| package.probes.get(&root_path)),
+            Some(&expected),
+        );
         Ok(())
     }
 
