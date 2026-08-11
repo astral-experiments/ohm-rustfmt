@@ -192,6 +192,11 @@ pub(super) fn format(
     verbosity: Verbosity,
     manifest_path: Option<&Path>,
 ) -> Result<i32, io::Error> {
+    if env::var_os("RUSTFMT_LOG").is_some() {
+        trace("formatting the complete target to preserve formatter logging");
+        return run_rustfmt(targets, arguments, verbosity);
+    }
+
     if verbosity == Verbosity::Verbose || has_observable_emit_mode(arguments) {
         trace("falling back to complete formatting for observable output");
         return run_rustfmt(targets, arguments, verbosity);
@@ -253,12 +258,7 @@ pub(super) fn format(
         trace("falling back to complete formatting for an invalid cache path");
         return run_rustfmt(targets, arguments, verbosity);
     };
-    let changed_leaf = if env::var_os("RUSTFMT_LOG").is_some() {
-        trace("formatting the complete target to preserve formatter logging");
-        None
-    } else {
-        plan.changed_leaf(&changed_roots)
-    };
+    let changed_leaf = plan.changed_leaf(&changed_roots);
     let mut output = run_rustfmt_with_output(
         &changed_targets,
         arguments,
