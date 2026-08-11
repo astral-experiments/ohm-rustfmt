@@ -1,13 +1,15 @@
 // Integration tests for cargo-fmt.
 
 use std::env;
+use std::fs;
 use std::path::Path;
 use std::process::Command;
 
 use rustfmt_config_proc_macro::rustfmt_only_ci_test;
+use sha2::{Digest, Sha256};
 
-/// Run the cargo-fmt executable and return its output.
-fn cargo_fmt(args: &[&str]) -> (String, String) {
+/// Runs the paired cargo-fmt and rustfmt executables from the local target directory.
+fn cargo_fmt_command() -> Command {
     let mut bin_dir = env::current_exe().unwrap();
     bin_dir.pop(); // chop off test exe name
     if bin_dir.ends_with("deps") {
@@ -21,12 +23,21 @@ fn cargo_fmt(args: &[&str]) -> (String, String) {
     paths.insert(0, bin_dir);
     let new_path = env::join_paths(paths).unwrap();
 
-    match Command::new(&cmd).args(args).env("PATH", new_path).output() {
+    let mut command = Command::new(cmd);
+    command.env("PATH", new_path);
+    command
+}
+
+/// Run the cargo-fmt executable and return its output.
+fn cargo_fmt(args: &[&str]) -> (String, String) {
+    let mut command = cargo_fmt_command();
+    command.args(args);
+    match command.output() {
         Ok(output) => (
             String::from_utf8(output.stdout).expect("utf-8"),
             String::from_utf8(output.stderr).expect("utf-8"),
         ),
-        Err(e) => panic!("failed to run `{cmd:?} {args:?}`: {e}"),
+        Err(e) => panic!("failed to run `{command:?} {args:?}`: {e}"),
     }
 }
 
@@ -116,4 +127,126 @@ fn cargo_fmt_emits_error_on_line_overflow_true() {
     assert!(stderr.contains(
         "line formatted, but exceeded maximum width (maximum: 100 (see `max_width` option)"
     ))
+}
+
+#[test]
+fn cargo_fmt_never_inherits_internal_module_handoffs() -> std::io::Result<()> {
+    let directory = tempfile::tempdir()?;
+    let package = directory.path().canonicalize()?;
+    let sources = package.join("src");
+    fs::create_dir(&sources)?;
+    let manifest = package.join("Cargo.toml");
+    let leaf = sources.join("child.rs");
+    let sibling = sources.join("sibling.rs");
+    let untrusted_manifest = package.join("untrusted-modules.json");
+    fs::write(
+        &manifest,
+        "[package]\nname = \"handoff-isolation\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )?;
+    fs::write(sources.join("lib.rs"), "mod child;\nmod sibling;\n")?;
+    fs::write(&leaf, "fn child() {}\n")?;
+    fs::write(&sibling, "fn sibling( ){ }\n")?;
+
+    let mut topology = Sha256::new();
+    topology.update(b"ohm.rustfmt.module-topology.v1\0");
+    topology.update(0_u64.to_le_bytes());
+    let topology = format!("{:x}", topology.finalize());
+
+    for enabled in ["0", "1"] {
+        let output = cargo_fmt_command()
+            .arg("--check")
+            .arg("--manifest-path")
+            .arg(&manifest)
+            .env("OHM_INCREMENTAL_FMT", enabled)
+            .env("OHM_INCREMENTAL_FMT_CACHE_DIR", package.join("cache"))
+            .env("OHM_RUSTFMT_MODULE_MANIFEST", &untrusted_manifest)
+            .env("OHM_RUSTFMT_CHANGED_MODULE", &leaf)
+            .env("OHM_RUSTFMT_MODULE_TOPOLOGY", &topology)
+            .output()?;
+
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "incremental={enabled}\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(stdout.contains(sibling.to_string_lossy().as_ref()));
+        assert!(!untrusted_manifest.exists());
+    }
+    Ok(())
+}
+
+#[test]
+fn cargo_fmt_logging_preserves_root_and_sibling_events_after_a_leaf_edit() -> std::io::Result<()> {
+    let directory = tempfile::tempdir()?;
+    let package = directory.path().canonicalize()?;
+    let sources = package.join("src");
+    fs::create_dir(&sources)?;
+    let manifest = package.join("Cargo.toml");
+    let leaf = sources.join("child.rs");
+    fs::write(
+        &manifest,
+        "[package]\nname = \"formatter-logging\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )?;
+    fs::write(
+        sources.join("lib.rs"),
+        "mod child;\nmod sibling;\n\npub fn root() {\n    let _root = 1;\n}\n",
+    )?;
+    fs::write(&leaf, "pub fn child() {\n    let _child = 1;\n}\n")?;
+    fs::write(
+        sources.join("sibling.rs"),
+        "pub fn sibling() {\n    let _sibling = 2;\n}\n",
+    )?;
+
+    let run = |enabled: &str, trace: bool| {
+        let mut command = cargo_fmt_command();
+        command
+            .arg("--check")
+            .arg("--manifest-path")
+            .arg(&manifest)
+            .current_dir(&package)
+            .env("OHM_INCREMENTAL_FMT", enabled)
+            .env("OHM_INCREMENTAL_FMT_CACHE_DIR", package.join("cache"))
+            .env("RUSTFMT_LOG", "rustfmt_nightly::visitor=debug");
+        if trace {
+            command.env("OHM_INCREMENTAL_FMT_TRACE", "1");
+        } else {
+            command.env_remove("OHM_INCREMENTAL_FMT_TRACE");
+        }
+        command.output()
+    };
+
+    let warmed = run("1", false)?;
+    assert!(
+        warmed.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&warmed.stdout),
+        String::from_utf8_lossy(&warmed.stderr),
+    );
+    fs::write(
+        &leaf,
+        "pub fn child() {\n    let _changed_child = 333;\n}\n",
+    )?;
+
+    let incremental = run("1", true)?;
+    let native = run("0", false)?;
+
+    assert!(incremental.status.success());
+    assert_eq!(incremental.status.code(), native.status.code());
+    let incremental_stdout = String::from_utf8_lossy(&incremental.stdout);
+    let native_stdout = String::from_utf8_lossy(&native.stdout);
+    assert!(incremental_stdout.contains("child.rs"));
+    assert!(incremental_stdout.contains("sibling.rs"));
+    assert!(incremental_stdout.contains("lib.rs"));
+    assert_eq!(
+        incremental_stdout.matches("visit_stmt:").count(),
+        native_stdout.matches("visit_stmt:").count(),
+    );
+    assert!(
+        String::from_utf8_lossy(&incremental.stderr)
+            .contains("formatting the complete target to preserve formatter logging")
+    );
+    Ok(())
 }
