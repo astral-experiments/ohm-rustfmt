@@ -821,7 +821,8 @@ fn write_authoritative_manifest<T: serde::Serialize>(path: &Path, manifest: &T) 
         .create_new(true)
         .open(&temporary)?;
     let result = (|| {
-        serde_json::to_writer(&mut file, &manifest).map_err(io::Error::other)?;
+        let contents = serde_json::to_vec(&manifest).map_err(io::Error::other)?;
+        file.write_all(&contents)?;
         file.flush()?;
         fs::rename(&temporary, path)
     })();
