@@ -583,8 +583,8 @@ impl Plan {
         let invocation = invocation_key(targets, arguments)?;
         let directory = cache_directory(manifest_path)?;
         let cache_path = directory.join(format!("{invocation}.json"));
-        let previous: Option<Snapshot> = match File::open(&cache_path) {
-            Ok(file) => serde_json::from_reader(file).ok(),
+        let previous: Option<Snapshot> = match fs::read(&cache_path) {
+            Ok(contents) => serde_json::from_slice(&contents).ok(),
             Err(error) if error.kind() == io::ErrorKind::NotFound => None,
             Err(error) => return Err(error),
         };
@@ -1612,8 +1612,8 @@ fn write_cache(path: &Path, snapshot: &Snapshot) -> io::Result<()> {
 
     fs::create_dir_all(parent)?;
     let temporary_path = path.with_extension(format!("{}.tmp", std::process::id()));
-    let file = File::create(&temporary_path)?;
-    serde_json::to_writer(file, snapshot).map_err(io::Error::other)?;
+    let contents = serde_json::to_vec(snapshot).map_err(io::Error::other)?;
+    fs::write(&temporary_path, contents)?;
     fs::rename(temporary_path, path)
 }
 
