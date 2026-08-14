@@ -463,6 +463,7 @@ fn format_target<T: Write>(
                 // siblings. Let the authoritative root pass emit any warnings once.
                 format_and_emit_report(session, Input::File(root));
             } else if has_warnings {
+                session.record_visible_diagnostics();
                 eprintln!(
                     "{}",
                     FormatReportFormatterBuilder::new(&report)
@@ -484,6 +485,7 @@ fn format_and_emit_report<T: Write>(session: &mut Session<'_, T>, input: Input) 
     match session.format(input) {
         Ok(report) => {
             if report.has_warnings() {
+                session.record_visible_diagnostics();
                 eprintln!(
                     "{}",
                     FormatReportFormatterBuilder::new(&report)
