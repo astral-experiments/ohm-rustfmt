@@ -324,5 +324,82 @@ fn cargo_fmt_caches_clean_checks_without_a_second_formatter_pass() -> std::io::R
         "{}",
         String::from_utf8_lossy(&second.stderr),
     );
+
+    let format = || {
+        Command::new(tools.join("cargo-fmt"))
+            .arg("--manifest-path")
+            .arg(&manifest)
+            .current_dir(&package)
+            .env("OHM_INCREMENTAL_FMT", "1")
+            .env("OHM_INCREMENTAL_FMT_TRACE", "1")
+            .env("OHM_INCREMENTAL_FMT_CACHE_DIR", package.join("cache"))
+            .env("DYLD_LIBRARY_PATH", &compiler_libraries)
+            .env("LD_LIBRARY_PATH", &compiler_libraries)
+            .env_remove("DYLD_FALLBACK_LIBRARY_PATH")
+            .output()
+    };
+    let checked_then_formatted = format()?;
+    assert!(checked_then_formatted.status.success());
+    assert!(
+        String::from_utf8_lossy(&checked_then_formatted.stderr)
+            .contains("cache hit: 1 unchanged packages"),
+        "{}",
+        String::from_utf8_lossy(&checked_then_formatted.stderr),
+    );
+
+    fs::write(sources.join("lib.rs"), "pub fn rewritten( ){ }\n")?;
+    let rewritten = format()?;
+    assert!(rewritten.status.success());
+    assert_eq!(
+        fs::read_to_string(sources.join("lib.rs"))?,
+        "pub fn rewritten() {}\n",
+    );
+
+    let formatted_then_checked = run()?;
+    assert!(formatted_then_checked.status.success());
+    assert!(
+        String::from_utf8_lossy(&formatted_then_checked.stderr)
+            .contains("cache hit: 1 unchanged packages"),
+        "{}",
+        String::from_utf8_lossy(&formatted_then_checked.stderr),
+    );
+
+    let with_file_emission = |check: bool, inline: bool| {
+        let mut command = Command::new(tools.join("cargo-fmt"));
+        command
+            .arg("--manifest-path")
+            .arg(&manifest)
+            .current_dir(&package)
+            .env("OHM_INCREMENTAL_FMT", "1")
+            .env("OHM_INCREMENTAL_FMT_TRACE", "1")
+            .env("OHM_INCREMENTAL_FMT_CACHE_DIR", package.join("cache"))
+            .env("DYLD_LIBRARY_PATH", &compiler_libraries)
+            .env("LD_LIBRARY_PATH", &compiler_libraries)
+            .env_remove("DYLD_FALLBACK_LIBRARY_PATH");
+        if check {
+            command.arg("--check");
+        }
+        command.arg("--");
+        if inline {
+            command.arg("--emit=files");
+        } else {
+            command.args(["--emit", "files"]);
+        }
+        command.output()
+    };
+
+    for inline in [false, true] {
+        let formatted = with_file_emission(false, inline)?;
+        assert!(formatted.status.success());
+
+        let rejected = with_file_emission(true, inline)?;
+        assert_eq!(rejected.status.code(), Some(1));
+        let error = String::from_utf8_lossy(&rejected.stderr);
+        assert!(
+            error.contains("Invalid to use `--emit` and `--check`"),
+            "{error}"
+        );
+        assert!(!error.contains("cache hit"), "{error}");
+    }
     Ok(())
 }
