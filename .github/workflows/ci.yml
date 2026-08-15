@@ -37,12 +37,17 @@ jobs:
 
   test:
     name: Test (${{ matrix.os }}, ${{ matrix.release-channel }})
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
         os: [depot-ubuntu-24.04-16, depot-macos-15]
         release-channel: [nightly, stable]
+        include:
+          - os: depot-ubuntu-24.04-16
+            runner: depot-ubuntu-24.04-16
+          - os: depot-macos-15
+            runner: namespace-profile-macos-15
     env:
       CFG_RELEASE_CHANNEL: ${{ matrix.release-channel }}
     steps:
