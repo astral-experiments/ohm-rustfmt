@@ -542,7 +542,7 @@ fn run_rustfmt_with_output(
     verbosity: Verbosity,
     output_mode: RustfmtOutputMode,
     manifest_directory: Option<&Path>,
-    changed_module: Option<(&Path, &str)>,
+    changed_modules: Option<&[(PathBuf, String)]>,
 ) -> Result<RustfmtOutput, io::Error> {
     let by_edition = targets
         .iter()
@@ -596,9 +596,16 @@ fn run_rustfmt_with_output(
             command.env("OHM_RUSTFMT_MODULE_MANIFEST", &manifest);
             module_manifests.push(manifest);
         }
-        if let Some((module, topology)) = changed_module {
-            command.env("OHM_RUSTFMT_CHANGED_MODULE", module);
-            command.env("OHM_RUSTFMT_MODULE_TOPOLOGY", topology);
+        if let Some(modules) = changed_modules {
+            let paths =
+                env::join_paths(modules.iter().map(|(path, _)| path)).map_err(io::Error::other)?;
+            let topologies = modules
+                .iter()
+                .map(|(_, topology)| topology.as_str())
+                .collect::<Vec<_>>()
+                .join(",");
+            command.env("OHM_RUSTFMT_CHANGED_MODULE", paths);
+            command.env("OHM_RUSTFMT_MODULE_TOPOLOGY", topologies);
         }
         if output_mode != RustfmtOutputMode::Inherit {
             command.stderr(std::process::Stdio::piped());
