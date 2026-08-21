@@ -28,6 +28,7 @@ mod all_targets {
                 path: get_path(target.path),
                 edition: target.edition,
                 kind: target.kind.to_owned(),
+                package_root: PathBuf::new(),
             }));
         }
     }
