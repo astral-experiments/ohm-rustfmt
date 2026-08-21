@@ -29,6 +29,7 @@ pub(crate) struct ParseSess {
     raw_psess: RawParseSess,
     ignore_path_set: Arc<IgnorePathSet>,
     can_reset_errors: Arc<AtomicBool>,
+    emitted_diagnostics: Arc<AtomicBool>,
     file_probes: Option<Arc<RecordedFileProbes>>,
 }
 
@@ -137,12 +138,14 @@ struct SilentOnIgnoredFilesEmitter {
     emitter: Box<DynEmitter>,
     has_non_ignorable_parser_errors: bool,
     can_reset: Arc<AtomicBool>,
+    emitted_diagnostics: Arc<AtomicBool>,
 }
 
 impl SilentOnIgnoredFilesEmitter {
     fn handle_non_ignoreable_error(&mut self, diag: DiagInner) {
         self.has_non_ignorable_parser_errors = true;
         self.can_reset.store(false, Ordering::Release);
+        self.emitted_diagnostics.store(true, Ordering::Release);
         self.emitter.emit_diagnostic(diag);
     }
 }
@@ -190,6 +193,7 @@ fn default_dcx(
     source_map: Arc<SourceMap>,
     ignore_path_set: Arc<IgnorePathSet>,
     can_reset: Arc<AtomicBool>,
+    emitted_diagnostics: Arc<AtomicBool>,
     show_parse_errors: bool,
     color: Color,
 ) -> DiagCtxt {
@@ -214,6 +218,7 @@ fn default_dcx(
         emitter,
         ignore_path_set: IntoDynSyncSend(ignore_path_set),
         can_reset,
+        emitted_diagnostics,
     }))
 }
 
@@ -241,11 +246,13 @@ impl ParseSess {
             SourceMap::new(FilePathMapping::empty())
         });
         let can_reset_errors = Arc::new(AtomicBool::new(false));
+        let emitted_diagnostics = Arc::new(AtomicBool::new(false));
 
         let dcx = default_dcx(
             Arc::clone(&source_map),
             Arc::clone(&ignore_path_set),
             Arc::clone(&can_reset_errors),
+            Arc::clone(&emitted_diagnostics),
             config.show_parse_errors(),
             config.color(),
         );
@@ -255,8 +262,14 @@ impl ParseSess {
             raw_psess,
             ignore_path_set,
             can_reset_errors,
+            emitted_diagnostics,
             file_probes,
         })
+    }
+
+    /// Includes warnings actually forwarded to rustfmt's original stderr emitter.
+    pub(crate) fn emitted_diagnostics(&self) -> bool {
+        self.emitted_diagnostics.load(Ordering::Acquire)
     }
 
     /// Routes resolver existence decisions through the native source-map loader.
@@ -497,6 +510,7 @@ mod tests {
                 emitter: Box::new(emitter_writer),
                 ignore_path_set: IntoDynSyncSend(ignore_path_set),
                 can_reset,
+                emitted_diagnostics: Arc::new(AtomicBool::new(false)),
             }
         }
 
@@ -555,6 +569,7 @@ mod tests {
             emitter.emit_diagnostic(non_fatal_diagnostic);
             assert_eq!(num_emitted_errors.load(Ordering::Acquire), 0);
             assert_eq!(can_reset_errors.load(Ordering::Acquire), true);
+            assert!(!emitter.emitted_diagnostics.load(Ordering::Acquire));
         }
 
         #[nightly_only_test]
@@ -576,6 +591,7 @@ mod tests {
             emitter.emit_diagnostic(non_fatal_diagnostic);
             assert_eq!(num_emitted_errors.load(Ordering::Acquire), 1);
             assert_eq!(can_reset_errors.load(Ordering::Acquire), false);
+            assert!(emitter.emitted_diagnostics.load(Ordering::Acquire));
         }
 
         #[nightly_only_test]
