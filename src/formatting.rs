@@ -355,6 +355,9 @@ fn format_project<T: FormatHandler>(
         )
     });
 
+    if context.psess.emitted_diagnostics() {
+        context.handler.record_visible_diagnostics();
+    }
     Ok(context.report)
 }
 
@@ -481,6 +484,9 @@ trait FormatHandler {
     /// Enables native filesystem recording only for callers requesting an authoritative graph.
     fn module_graph_enabled(&self) -> bool;
 
+    /// Remembers parser diagnostics that were visible during this formatter invocation.
+    fn record_visible_diagnostics(&mut self);
+
     /// Reports formatted files separately from all parser-loaded sources and resolver probes.
     fn record_module_graph<'a, 'l, 'd>(
         &mut self,
@@ -503,6 +509,10 @@ trait FormatHandler {
 impl<'b, T: Write + 'b> FormatHandler for Session<'b, T> {
     fn module_graph_enabled(&self) -> bool {
         Session::module_graph_enabled(self)
+    }
+
+    fn record_visible_diagnostics(&mut self) {
+        Session::record_visible_diagnostics(self);
     }
 
     fn record_module_graph<'a, 'l, 'd>(
