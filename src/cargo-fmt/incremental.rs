@@ -1218,9 +1218,10 @@ fn collect_ancestor_configuration(
     configuration: &mut BTreeMap<String, String>,
 ) -> io::Result<()> {
     for ancestor in directory.ancestors() {
-        if !visited.insert(ancestor.to_owned()) {
-            continue;
+        if visited.contains(ancestor) {
+            break;
         }
+        visited.insert(ancestor.to_owned());
         for name in [
             "rustfmt.toml",
             ".rustfmt.toml",
@@ -2357,6 +2358,35 @@ mod tests {
                 "/workspace/second/src/lib.rs"
             ])
         );
+    }
+
+    #[test]
+    fn ancestor_configuration_discovers_nested_and_newly_created_files() -> io::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let root = directory.path().canonicalize()?;
+        let nested = root.join("package/src/nested");
+        fs::create_dir_all(&nested)?;
+        let workspace = root.join("rustfmt.toml");
+        fs::write(&workspace, "max_width = 100\n")?;
+        let cargo_directory = root.join(".cargo");
+        fs::create_dir(&cargo_directory)?;
+        let cargo = cargo_directory.join("config.toml");
+        fs::write(&cargo, "[build]\njobs = 4\n")?;
+
+        let mut before = BTreeMap::new();
+        collect_ancestor_configuration(&nested, &mut BTreeSet::new(), &mut before)?;
+        assert!(before.contains_key(&path_string(&workspace)?));
+        assert!(before.contains_key(&path_string(&cargo)?));
+
+        let local = nested.join(".rustfmt.toml");
+        fs::write(&local, "max_width = 80\n")?;
+        let mut after = BTreeMap::new();
+        collect_ancestor_configuration(&nested, &mut BTreeSet::new(), &mut after)?;
+
+        assert!(after.contains_key(&path_string(&workspace)?));
+        assert!(after.contains_key(&path_string(&cargo)?));
+        assert!(after.contains_key(&path_string(&local)?));
+        Ok(())
     }
 
     #[cfg(unix)]
