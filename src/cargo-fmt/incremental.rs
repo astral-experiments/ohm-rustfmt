@@ -1167,7 +1167,9 @@ fn read_module_manifests(paths: &[PathBuf], targets: &BTreeSet<Target>) -> io::R
             canonical_module_path(&root.path)?;
             let mut files = BTreeSet::new();
             for path in root.files {
-                canonical_module_path(&path)?;
+                if path != root.path {
+                    canonical_module_path(&path)?;
+                }
                 if !files.insert(path) {
                     return Err(unsupported(
                         "the authoritative module manifest repeats a source file",
@@ -1176,7 +1178,9 @@ fn read_module_manifests(paths: &[PathBuf], targets: &BTreeSet<Target>) -> io::R
             }
             let mut dependencies = BTreeSet::new();
             for path in root.dependencies {
-                canonical_module_path(&path)?;
+                if !files.contains(&path) {
+                    canonical_module_path(&path)?;
+                }
                 if !dependencies.insert(path) {
                     return Err(unsupported(
                         "the authoritative module manifest repeats a parsed dependency",
@@ -1195,7 +1199,6 @@ fn read_module_manifests(paths: &[PathBuf], targets: &BTreeSet<Target>) -> io::R
             }
             let mut leaves = BTreeMap::new();
             for (path, topology) in root.leaves {
-                canonical_module_path(&path)?;
                 if path == root.path
                     || !files.contains(&path)
                     || !valid_topology_digest(&topology)
@@ -1208,6 +1211,7 @@ fn read_module_manifests(paths: &[PathBuf], targets: &BTreeSet<Target>) -> io::R
             }
 
             let mut observations = BTreeMap::new();
+            let mut observed_dependencies = BTreeSet::new();
             for probe in root.probes {
                 let expected = ProbeObservation {
                     canonical: probe.canonical,
@@ -1226,17 +1230,16 @@ fn read_module_manifests(paths: &[PathBuf], targets: &BTreeSet<Target>) -> io::R
                         "an authoritative source probe changed during formatting",
                     ));
                 }
+                if let Some(canonical) = expected.canonical.as_ref() {
+                    observed_dependencies.insert(canonical.clone());
+                }
                 if observations.insert(probe.path, expected).is_some() {
                     return Err(unsupported(
                         "the authoritative module manifest repeats a resolution probe",
                     ));
                 }
             }
-            if dependencies.iter().any(|dependency| {
-                !observations.values().any(|observation| {
-                    observation.exists && observation.canonical.as_ref() == Some(dependency)
-                })
-            }) {
+            if !dependencies.is_subset(&observed_dependencies) {
                 return Err(unsupported(
                     "the authoritative module manifest omits a loaded source probe",
                 ));
