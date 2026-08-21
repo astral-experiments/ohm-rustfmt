@@ -261,10 +261,9 @@ fn cargo_fmt_logging_preserves_root_and_sibling_events_after_a_leaf_edit() -> st
 }
 
 #[cfg(unix)]
-#[test]
-fn cargo_fmt_caches_clean_checks_without_a_second_formatter_pass() -> std::io::Result<()> {
-    let directory = tempfile::tempdir()?;
-    let package = directory.path().canonicalize()?;
+fn trusted_formatter_tools(
+    package: &Path,
+) -> std::io::Result<(std::path::PathBuf, std::path::PathBuf)> {
     let tools = package.join("tools");
     fs::create_dir(&tools)?;
     let executable = cargo_fmt_command().get_program().to_owned();
@@ -294,6 +293,15 @@ fn cargo_fmt_caches_clean_checks_without_a_second_formatter_pass() -> std::io::R
         .ok_or_else(|| std::io::Error::other("the integration compiler has no sysroot"))?
         .join("lib");
     std::os::unix::fs::symlink(&compiler, tools.join("rustc"))?;
+    Ok((tools, compiler_libraries))
+}
+
+#[cfg(unix)]
+#[test]
+fn cargo_fmt_caches_clean_checks_without_a_second_formatter_pass() -> std::io::Result<()> {
+    let directory = tempfile::tempdir()?;
+    let package = directory.path().canonicalize()?;
+    let (tools, compiler_libraries) = trusted_formatter_tools(&package)?;
     let sources = package.join("src");
     fs::create_dir(&sources)?;
     let manifest = package.join("Cargo.toml");
@@ -410,5 +418,83 @@ fn cargo_fmt_caches_clean_checks_without_a_second_formatter_pass() -> std::io::R
         );
         assert!(!error.contains("cache hit"), "{error}");
     }
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn cargo_fmt_batches_clean_leaves_without_hiding_multiple_formatting_errors() -> std::io::Result<()>
+{
+    let directory = tempfile::tempdir()?;
+    let package = directory.path().canonicalize()?;
+    let (tools, compiler_libraries) = trusted_formatter_tools(&package)?;
+    let sources = package.join("src");
+    fs::create_dir(&sources)?;
+    let manifest = package.join("Cargo.toml");
+    fs::write(
+        &manifest,
+        "[package]\nname = \"multiple-leaf-check\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )?;
+    fs::write(
+        sources.join("lib.rs"),
+        concat!(
+            "mod first;\nmod second;\nmod unchanged_first;\n",
+            "mod unchanged_second;\nmod unchanged_third;\n",
+        ),
+    )?;
+    let first = sources.join("first.rs");
+    let second = sources.join("second.rs");
+    fs::write(&first, "pub fn first() {}\n")?;
+    fs::write(&second, "pub fn second() {}\n")?;
+    for name in ["unchanged_first", "unchanged_second", "unchanged_third"] {
+        fs::write(
+            sources.join(format!("{name}.rs")),
+            format!("pub fn {name}() {{}}\n"),
+        )?;
+    }
+
+    let run = |enabled: &str| {
+        Command::new(tools.join("cargo-fmt"))
+            .arg("--check")
+            .arg("--manifest-path")
+            .arg(&manifest)
+            .current_dir(&package)
+            .env("OHM_INCREMENTAL_FMT", enabled)
+            .env("OHM_INCREMENTAL_FMT_TRACE", "1")
+            .env("OHM_INCREMENTAL_FMT_CACHE_DIR", package.join("cache"))
+            .env("DYLD_LIBRARY_PATH", &compiler_libraries)
+            .env("LD_LIBRARY_PATH", &compiler_libraries)
+            .env_remove("DYLD_FALLBACK_LIBRARY_PATH")
+            .output()
+    };
+
+    assert!(run("1")?.status.success());
+    fs::write(&first, "pub fn changed_first() {}\n")?;
+    fs::write(&second, "pub fn changed_second() {}\n")?;
+    let changed = std::time::UNIX_EPOCH + std::time::Duration::from_secs(2_000_000_000);
+    for source in [&first, &second] {
+        fs::OpenOptions::new()
+            .write(true)
+            .open(source)?
+            .set_times(fs::FileTimes::new().set_modified(changed))?;
+    }
+    let batched = run("1")?;
+    assert!(batched.status.success());
+    assert!(
+        String::from_utf8_lossy(&batched.stderr).contains("formatted 2 unchanged direct leaves"),
+        "{}",
+        String::from_utf8_lossy(&batched.stderr),
+    );
+
+    fs::write(&first, "pub fn first( ){ }\n")?;
+    fs::write(&second, "pub fn second( ){ }\n")?;
+    let incremental = run("1")?;
+    let native = run("0")?;
+    assert_eq!(incremental.status.code(), Some(1));
+    assert_eq!(incremental.status.code(), native.status.code());
+    assert_eq!(incremental.stdout, native.stdout);
+    let stdout = String::from_utf8_lossy(&incremental.stdout);
+    assert!(stdout.contains("first.rs"));
+    assert!(stdout.contains("second.rs"));
     Ok(())
 }
