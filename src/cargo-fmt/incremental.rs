@@ -14,7 +14,7 @@ use super::{
     run_rustfmt_with_output, rustfmt_command,
 };
 
-const CACHE_VERSION: u32 = 9;
+const CACHE_VERSION: u32 = 10;
 const MODULE_MANIFEST_VERSION: u32 = 3;
 const MODULE_MANIFEST_SCHEMA: &str = "ohm.rustfmt-files";
 const MODULE_MANIFEST_ENVIRONMENT: &str = "OHM_RUSTFMT_MODULE_MANIFEST";
@@ -37,6 +37,7 @@ struct Snapshot {
     version: u32,
     invocation: String,
     configuration: BTreeMap<String, String>,
+    configuration_fingerprints: BTreeMap<String, ConfigurationFingerprint>,
     packages: BTreeMap<String, PackageSnapshot>,
 }
 
@@ -94,6 +95,44 @@ impl SourceFingerprint {
             modified_seconds,
             modified_nanoseconds,
             permissions_mode,
+        })
+    }
+}
+
+/// Reuses an existing configuration digest only while its native file identity is unchanged.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ConfigurationFingerprint {
+    canonical: String,
+    source: SourceFingerprint,
+    length: u64,
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+    #[cfg(unix)]
+    changed_seconds: i64,
+    #[cfg(unix)]
+    changed_nanoseconds: i64,
+}
+
+impl ConfigurationFingerprint {
+    fn new(canonical: String, metadata: &fs::Metadata) -> io::Result<Self> {
+        #[cfg(unix)]
+        use std::os::unix::fs::MetadataExt;
+
+        Ok(Self {
+            canonical,
+            source: SourceFingerprint::from_metadata(metadata)?,
+            length: metadata.len(),
+            #[cfg(unix)]
+            device: metadata.dev(),
+            #[cfg(unix)]
+            inode: metadata.ino(),
+            #[cfg(unix)]
+            changed_seconds: metadata.ctime(),
+            #[cfg(unix)]
+            changed_nanoseconds: metadata.ctime_nsec(),
         })
     }
 }
@@ -289,6 +328,7 @@ pub(super) fn format(
                 &leaves,
                 &probes,
                 None,
+                Some(&plan.current),
             ) {
                 Ok(updated) if updated == plan.current => {
                     trace(&format!("formatted unchanged direct leaf {}", leaf.path));
@@ -377,6 +417,7 @@ pub(super) fn format(
         &leaves,
         &probes,
         None,
+        Some(&plan.current),
     ) {
         Ok(updated)
             if plan.can_record(&updated, &changed_roots, check_only)
@@ -423,6 +464,7 @@ pub(super) fn format(
                 &leaves,
                 &probes,
                 None,
+                Some(&updated),
             ) {
                 Ok(verified) if verified == updated => verified,
                 Ok(_) => {
@@ -619,6 +661,7 @@ impl Plan {
             &leaves,
             &probes,
             Some(&invocation),
+            previous.as_ref(),
         ) {
             Ok(current) => current,
             Err(_) if previous.is_some() => {
@@ -632,6 +675,7 @@ impl Plan {
                     &LeafGraph::new(),
                     &ProbeGraph::new(),
                     Some(&invocation),
+                    None,
                 )?
             }
             Err(error) => return Err(error),
@@ -831,6 +875,7 @@ impl Snapshot {
         leaves: &LeafGraph,
         probes: &ProbeGraph,
         invocation: Option<&str>,
+        previous: Option<&Snapshot>,
     ) -> io::Result<Self> {
         let mut packages = BTreeMap::new();
         let mut file_fingerprints = BTreeMap::new();
@@ -910,18 +955,35 @@ impl Snapshot {
         let current_directory = env::current_dir()?.canonicalize()?;
         configuration_directories.insert(current_directory);
         let mut configuration = BTreeMap::new();
+        let mut configuration_fingerprints = BTreeMap::new();
         let mut visited_directories = BTreeSet::new();
         for directory in configuration_directories {
             collect_ancestor_configuration(
                 &directory,
                 &mut visited_directories,
                 &mut configuration,
+                &mut configuration_fingerprints,
+                previous,
             )?;
         }
-        collect_global_configuration(&mut configuration)?;
-        collect_explicit_configuration(arguments, &mut configuration)?;
+        collect_global_configuration(
+            &mut configuration,
+            &mut configuration_fingerprints,
+            previous,
+        )?;
+        collect_explicit_configuration(
+            arguments,
+            &mut configuration,
+            &mut configuration_fingerprints,
+            previous,
+        )?;
         if let Some(path) = manifest_path {
-            collect_configuration_file(path, &mut configuration)?;
+            collect_configuration_file_cached(
+                path,
+                &mut configuration,
+                &mut configuration_fingerprints,
+                previous,
+            )?;
         }
 
         Ok(Self {
@@ -931,6 +993,7 @@ impl Snapshot {
                 None => invocation_key(targets, arguments)?,
             },
             configuration,
+            configuration_fingerprints,
             packages,
         })
     }
@@ -1216,6 +1279,8 @@ fn collect_ancestor_configuration(
     directory: &Path,
     visited: &mut BTreeSet<PathBuf>,
     configuration: &mut BTreeMap<String, String>,
+    fingerprints: &mut BTreeMap<String, ConfigurationFingerprint>,
+    previous: Option<&Snapshot>,
 ) -> io::Result<()> {
     for ancestor in directory.ancestors() {
         if visited.contains(ancestor) {
@@ -1232,7 +1297,12 @@ fn collect_ancestor_configuration(
             ".cargo/config",
             ".cargo/config.toml",
         ] {
-            collect_configuration_file(&ancestor.join(name), configuration)?;
+            collect_configuration_file_cached(
+                &ancestor.join(name),
+                configuration,
+                fingerprints,
+                previous,
+            )?;
         }
     }
 
@@ -1240,7 +1310,11 @@ fn collect_ancestor_configuration(
 }
 
 /// Includes the home and platform-specific formatter configuration search locations.
-fn collect_global_configuration(configuration: &mut BTreeMap<String, String>) -> io::Result<()> {
+fn collect_global_configuration(
+    configuration: &mut BTreeMap<String, String>,
+    fingerprints: &mut BTreeMap<String, ConfigurationFingerprint>,
+    previous: Option<&Snapshot>,
+) -> io::Result<()> {
     for directory in [
         dirs::home_dir(),
         dirs::config_dir().map(|path| path.join("rustfmt")),
@@ -1249,7 +1323,12 @@ fn collect_global_configuration(configuration: &mut BTreeMap<String, String>) ->
     .flatten()
     {
         for name in [".rustfmt.toml", "rustfmt.toml"] {
-            collect_configuration_file(&directory.join(name), configuration)?;
+            collect_configuration_file_cached(
+                &directory.join(name),
+                configuration,
+                fingerprints,
+                previous,
+            )?;
         }
     }
 
@@ -1260,6 +1339,8 @@ fn collect_global_configuration(configuration: &mut BTreeMap<String, String>) ->
 fn collect_explicit_configuration(
     arguments: &[String],
     configuration: &mut BTreeMap<String, String>,
+    fingerprints: &mut BTreeMap<String, ConfigurationFingerprint>,
+    previous: Option<&Snapshot>,
 ) -> io::Result<()> {
     let mut arguments = arguments.iter();
     while let Some(argument) = arguments.next() {
@@ -1274,11 +1355,21 @@ fn collect_explicit_configuration(
         };
 
         if path.is_dir() {
-            collect_configuration_file(&path.join("rustfmt.toml"), configuration)?;
-            collect_configuration_file(&path.join(".rustfmt.toml"), configuration)?;
+            collect_configuration_file_cached(
+                &path.join("rustfmt.toml"),
+                configuration,
+                fingerprints,
+                previous,
+            )?;
+            collect_configuration_file_cached(
+                &path.join(".rustfmt.toml"),
+                configuration,
+                fingerprints,
+                previous,
+            )?;
         } else {
             reject_observable_formatter_configuration(&path)?;
-            collect_configuration_file(&path, configuration)?;
+            collect_configuration_file_cached(&path, configuration, fingerprints, previous)?;
         }
     }
 
@@ -1286,12 +1377,23 @@ fn collect_explicit_configuration(
 }
 
 /// Hashes existing settings under their logical names so symlink precedence remains visible.
+#[cfg(test)]
 fn collect_configuration_file(
     path: &Path,
     configuration: &mut BTreeMap<String, String>,
 ) -> io::Result<()> {
-    match fs::metadata(path) {
-        Ok(metadata) if metadata.is_file() => {}
+    collect_configuration_file_cached(path, configuration, &mut BTreeMap::new(), None)
+}
+
+/// Reuses authenticated configuration digests across consecutive workspace snapshots.
+fn collect_configuration_file_cached(
+    path: &Path,
+    configuration: &mut BTreeMap<String, String>,
+    fingerprints: &mut BTreeMap<String, ConfigurationFingerprint>,
+    previous: Option<&Snapshot>,
+) -> io::Result<()> {
+    let metadata = match fs::metadata(path) {
+        Ok(metadata) if metadata.is_file() => metadata,
         Ok(_) => return Ok(()),
         Err(error)
             if matches!(
@@ -1302,14 +1404,7 @@ fn collect_configuration_file(
             return Ok(());
         }
         Err(error) => return Err(error),
-    }
-
-    if matches!(
-        path.file_name().and_then(|name| name.to_str()),
-        Some("rustfmt.toml" | ".rustfmt.toml")
-    ) {
-        reject_observable_formatter_configuration(path)?;
-    }
+    };
 
     // Keep the searched name as well as its canonical destination: rustfmt
     // gives `.rustfmt.toml` precedence over `rustfmt.toml`, even when both are
@@ -1323,8 +1418,28 @@ fn collect_configuration_file(
     if !configuration.contains_key(&key) {
         let canonical_path = path.canonicalize()?;
         let canonical = path_string(&canonical_path)?;
-        let digest = hash_configuration_file(&canonical_path)?;
-        configuration.insert(key, format!("{canonical}:{digest}"));
+        let fingerprint = ConfigurationFingerprint::new(canonical.clone(), &metadata)?;
+        if let Some((digest, _)) = previous
+            .and_then(|snapshot| {
+                snapshot
+                    .configuration
+                    .get(&key)
+                    .zip(snapshot.configuration_fingerprints.get(&key))
+            })
+            .filter(|(_, previous_fingerprint)| *previous_fingerprint == &fingerprint)
+        {
+            configuration.insert(key.clone(), digest.clone());
+        } else {
+            if matches!(
+                path.file_name().and_then(|name| name.to_str()),
+                Some("rustfmt.toml" | ".rustfmt.toml")
+            ) {
+                reject_observable_formatter_configuration(path)?;
+            }
+            let digest = hash_configuration_file(&canonical_path)?;
+            configuration.insert(key.clone(), format!("{canonical}:{digest}"));
+        }
+        fingerprints.insert(key, fingerprint);
     }
     Ok(())
 }
@@ -1743,6 +1858,7 @@ mod tests {
                 String::from("/workspace/rustfmt.toml"),
                 String::from("original-config"),
             )]),
+            configuration_fingerprints: BTreeMap::new(),
             packages: files
                 .iter()
                 .map(|(package, sources)| {
@@ -2374,18 +2490,66 @@ mod tests {
         fs::write(&cargo, "[build]\njobs = 4\n")?;
 
         let mut before = BTreeMap::new();
-        collect_ancestor_configuration(&nested, &mut BTreeSet::new(), &mut before)?;
+        collect_ancestor_configuration(
+            &nested,
+            &mut BTreeSet::new(),
+            &mut before,
+            &mut BTreeMap::new(),
+            None,
+        )?;
         assert!(before.contains_key(&path_string(&workspace)?));
         assert!(before.contains_key(&path_string(&cargo)?));
 
         let local = nested.join(".rustfmt.toml");
         fs::write(&local, "max_width = 80\n")?;
         let mut after = BTreeMap::new();
-        collect_ancestor_configuration(&nested, &mut BTreeSet::new(), &mut after)?;
+        collect_ancestor_configuration(
+            &nested,
+            &mut BTreeSet::new(),
+            &mut after,
+            &mut BTreeMap::new(),
+            None,
+        )?;
 
         assert!(after.contains_key(&path_string(&workspace)?));
         assert!(after.contains_key(&path_string(&cargo)?));
         assert!(after.contains_key(&path_string(&local)?));
+        Ok(())
+    }
+
+    #[test]
+    fn configuration_digests_are_reused_only_for_unchanged_file_identity() -> io::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let configuration = directory.path().join("Cargo.lock");
+        fs::write(&configuration, "version = 4\n")?;
+        let key = path_string(&configuration)?;
+
+        let mut values = BTreeMap::new();
+        let mut fingerprints = BTreeMap::new();
+        collect_configuration_file_cached(&configuration, &mut values, &mut fingerprints, None)?;
+
+        let mut previous = snapshot(&[]);
+        previous.configuration = BTreeMap::from([(key.clone(), String::from("cached-digest"))]);
+        previous.configuration_fingerprints = fingerprints;
+
+        let mut reused = BTreeMap::new();
+        collect_configuration_file_cached(
+            &configuration,
+            &mut reused,
+            &mut BTreeMap::new(),
+            Some(&previous),
+        )?;
+        assert_eq!(reused.get(&key).map(String::as_str), Some("cached-digest"));
+
+        fs::write(&configuration, "version = 400\n")?;
+        let mut changed = BTreeMap::new();
+        collect_configuration_file_cached(
+            &configuration,
+            &mut changed,
+            &mut BTreeMap::new(),
+            Some(&previous),
+        )?;
+        assert_ne!(changed.get(&key).map(String::as_str), Some("cached-digest"));
         Ok(())
     }
 
@@ -3069,6 +3233,7 @@ mod tests {
             &LeafGraph::new(),
             &ProbeGraph::from([(root_path.clone(), expected.clone())]),
             Some("canonical-source-probes"),
+            None,
         )?;
 
         assert_eq!(
