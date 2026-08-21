@@ -367,6 +367,12 @@ fn cargo_fmt_caches_clean_checks_without_a_second_formatter_pass() -> std::io::R
     fs::write(sources.join("lib.rs"), "pub fn rewritten( ){ }\n")?;
     let rewritten = format()?;
     assert!(rewritten.status.success());
+    assert!(
+        !String::from_utf8_lossy(&rewritten.stderr)
+            .contains("caching an unchanged formatter pass without reverification"),
+        "{}",
+        String::from_utf8_lossy(&rewritten.stderr),
+    );
     assert_eq!(
         fs::read_to_string(sources.join("lib.rs"))?,
         "pub fn rewritten() {}\n",
@@ -379,6 +385,24 @@ fn cargo_fmt_caches_clean_checks_without_a_second_formatter_pass() -> std::io::R
             .contains("cache hit: 1 unchanged packages"),
         "{}",
         String::from_utf8_lossy(&formatted_then_checked.stderr),
+    );
+
+    fs::remove_dir_all(package.join("cache"))?;
+    let clean_write = format()?;
+    assert!(clean_write.status.success());
+    assert!(
+        String::from_utf8_lossy(&clean_write.stderr)
+            .contains("caching an unchanged formatter pass without reverification"),
+        "{}",
+        String::from_utf8_lossy(&clean_write.stderr),
+    );
+    let clean_write_then_checked = run()?;
+    assert!(clean_write_then_checked.status.success());
+    assert!(
+        String::from_utf8_lossy(&clean_write_then_checked.stderr)
+            .contains("cache hit: 1 unchanged packages"),
+        "{}",
+        String::from_utf8_lossy(&clean_write_then_checked.stderr),
     );
 
     let with_file_emission = |check: bool, inline: bool| {

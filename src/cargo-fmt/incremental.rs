@@ -112,6 +112,8 @@ struct ProbeObservation {
 struct ModuleManifest {
     schema: String,
     version: u32,
+    #[serde(default)]
+    unchanged: bool,
     roots: Vec<ModuleRoot>,
 }
 
@@ -140,6 +142,7 @@ struct Discovery {
     modules: ModuleGraph,
     leaves: LeafGraph,
     probes: ProbeGraph,
+    unchanged: bool,
 }
 
 /// Identifies a clean, context-preserving formatter run over verified direct leaves.
@@ -190,8 +193,8 @@ fn incremental_formatting_enabled(value: Result<String, env::VarError>) -> bool 
 
 /// Formats only invalidated targets while preserving normal output and fail-closed semantics.
 ///
-/// Read-only checks publish their clean authoritative producer proof immediately;
-/// write-mode formatting additionally verifies a second pass before updating the cache.
+/// Read-only checks and unchanged writes publish their clean authoritative proof immediately;
+/// rewritten sources still require a second pass before updating the cache.
 pub(super) fn format(
     targets: &BTreeSet<Target>,
     arguments: &[String],
@@ -388,6 +391,7 @@ pub(super) fn format(
         };
     }
 
+    let unchanged = discovered.unchanged;
     let mut modules = plan.current.module_graph();
     let mut leaves = plan.current.leaf_graph();
     let mut probes = plan.current.probe_graph();
@@ -405,11 +409,15 @@ pub(super) fn format(
         None,
     ) {
         Ok(updated)
-            if plan.can_record(&updated, &changed_roots, check_only)
+            if plan.can_record(&updated, &changed_roots, check_only || unchanged)
                 && updated.probe_graph() == probes =>
         {
-            if check_only {
-                trace("caching a clean read-only formatter pass without reverification");
+            if check_only || unchanged {
+                if check_only {
+                    trace("caching a clean read-only formatter pass without reverification");
+                } else {
+                    trace("caching an unchanged formatter pass without reverification");
+                }
                 if let Err(error) = write_cache(&plan.cache_path, &updated) {
                     trace(&format!("could not update the formatting cache: {error}"));
                 }
@@ -1084,6 +1092,7 @@ fn read_module_manifests(paths: &[PathBuf], targets: &BTreeSet<Target>) -> io::R
     let mut roots = ModuleGraph::new();
     let mut leaf_roots = LeafGraph::new();
     let mut probe_roots = ProbeGraph::new();
+    let mut unchanged = true;
     for path in paths {
         let manifest = read_module_manifest(path);
         let removal = fs::remove_file(path);
@@ -1094,6 +1103,7 @@ fn read_module_manifests(paths: &[PathBuf], targets: &BTreeSet<Target>) -> io::R
         {
             return Err(unsupported("rustfmt produced an unknown module manifest"));
         }
+        unchanged &= manifest.unchanged;
 
         for root in manifest.roots {
             if !expected.contains(&root.path) || roots.contains_key(&root.path) {
@@ -1198,6 +1208,7 @@ fn read_module_manifests(paths: &[PathBuf], targets: &BTreeSet<Target>) -> io::R
         modules: roots,
         leaves: leaf_roots,
         probes: probe_roots,
+        unchanged,
     })
 }
 
@@ -2293,6 +2304,7 @@ mod tests {
             modules: modules.clone(),
             leaves: LeafGraph::from([(root.clone(), BTreeMap::new())]),
             probes: probes.clone(),
+            unchanged: true,
         };
         let leaves = discovery.leaves.clone();
         assert!(discovery_matches(&discovery, &modules, &leaves, &probes));
@@ -2879,6 +2891,7 @@ mod tests {
             &ModuleManifest {
                 schema: String::from(MODULE_MANIFEST_SCHEMA),
                 version: MODULE_MANIFEST_VERSION,
+                unchanged: true,
                 roots: vec![ModuleRoot {
                     path: path_string(&root)?,
                     files: vec![path_string(&root)?, path_string(&generated)?],
@@ -2924,6 +2937,7 @@ mod tests {
             &ModuleManifest {
                 schema: String::from(MODULE_MANIFEST_SCHEMA),
                 version: MODULE_MANIFEST_VERSION,
+                unchanged: true,
                 roots: vec![],
             },
         )?;
@@ -2935,6 +2949,7 @@ mod tests {
             &ModuleManifest {
                 schema: String::from(MODULE_MANIFEST_SCHEMA),
                 version: MODULE_MANIFEST_VERSION,
+                unchanged: true,
                 roots: vec![ModuleRoot {
                     path: path_string(&root)?,
                     files: vec![],
@@ -2952,10 +2967,21 @@ mod tests {
             &ModuleManifest {
                 schema: String::from(MODULE_MANIFEST_SCHEMA),
                 version: MODULE_MANIFEST_VERSION + 1,
+                unchanged: true,
                 roots: vec![],
             },
         )?;
         assert!(read_module_manifests(&[wrong_version], &targets).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_manifests_never_claim_the_formatter_left_sources_unchanged() -> io::Result<()> {
+        let manifest: ModuleManifest =
+            serde_json::from_str(r#"{"schema":"ohm.rustfmt-files","version":3,"roots":[]}"#)
+                .map_err(io::Error::other)?;
+
+        assert!(!manifest.unchanged);
         Ok(())
     }
 
@@ -2974,6 +3000,7 @@ mod tests {
             &ModuleManifest {
                 schema: String::from(MODULE_MANIFEST_SCHEMA),
                 version: MODULE_MANIFEST_VERSION,
+                unchanged: true,
                 roots: vec![ModuleRoot {
                     path: root_path.clone(),
                     files: vec![root_path.clone(), root_path.clone()],
@@ -2991,6 +3018,7 @@ mod tests {
             &ModuleManifest {
                 schema: String::from(MODULE_MANIFEST_SCHEMA),
                 version: MODULE_MANIFEST_VERSION,
+                unchanged: true,
                 roots: vec![ModuleRoot {
                     path: root_path.clone(),
                     files: vec![root_path.clone()],
@@ -3015,6 +3043,7 @@ mod tests {
             &ModuleManifest {
                 schema: String::from(MODULE_MANIFEST_SCHEMA),
                 version: MODULE_MANIFEST_VERSION,
+                unchanged: true,
                 roots: vec![record.clone(), record],
             },
         )?;
@@ -3026,6 +3055,7 @@ mod tests {
             &ModuleManifest {
                 schema: String::from(MODULE_MANIFEST_SCHEMA),
                 version: MODULE_MANIFEST_VERSION,
+                unchanged: true,
                 roots: vec![ModuleRoot {
                     path: path_string(&root)?,
                     files: vec![path_string(&root)?],
@@ -3052,6 +3082,7 @@ mod tests {
             &ModuleManifest {
                 schema: String::from(MODULE_MANIFEST_SCHEMA),
                 version: MODULE_MANIFEST_VERSION,
+                unchanged: true,
                 roots: vec![ModuleRoot {
                     path: path_string(&root)?,
                     files: vec![String::from("lib.rs")],
@@ -3080,6 +3111,7 @@ mod tests {
             &ModuleManifest {
                 schema: String::from(MODULE_MANIFEST_SCHEMA),
                 version: MODULE_MANIFEST_VERSION,
+                unchanged: true,
                 roots: vec![ModuleRoot {
                     path: path_string(&root)?,
                     files: vec![path_string(&root)?, path_string(&module)?],
@@ -3107,6 +3139,7 @@ mod tests {
             &ModuleManifest {
                 schema: String::from(MODULE_MANIFEST_SCHEMA),
                 version: MODULE_MANIFEST_VERSION,
+                unchanged: true,
                 roots: vec![ModuleRoot {
                     path: path_string(&root)?,
                     files: vec![path_string(&root)?],
