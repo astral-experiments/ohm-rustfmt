@@ -178,8 +178,20 @@ fn direct_root_module_topology(
     leaf: &Path,
     module: &Module<'_>,
 ) -> Option<String> {
-    let topology = modules::module_topology(module)?;
     let directory = root.parent()?;
+    let parent = leaf.parent()?;
+    let filename = leaf.file_name()?.to_str()?;
+    let module_name = if filename == "mod.rs" {
+        if parent.parent()? != directory {
+            return None;
+        }
+        parent.file_name()?.to_str()?
+    } else {
+        if parent != directory {
+            return None;
+        }
+        filename.strip_suffix(".rs")?
+    };
     let canonical_directory = directory.canonicalize().ok()?;
     let canonical_leaf = leaf.canonicalize().ok()?;
 
@@ -196,6 +208,9 @@ fn direct_root_module_topology(
         let Some(name) = item.kind.ident() else {
             return false;
         };
+        if name.to_string() != module_name {
+            return false;
+        }
         let filename = format!("{name}.rs");
         let module_directory = name.to_string();
         let candidates = [
@@ -222,7 +237,7 @@ fn direct_root_module_topology(
                 logical.as_path() == canonical.as_path() && canonical == &canonical_leaf
             })
     });
-    direct.then_some(topology)
+    direct.then(|| modules::module_topology(module)).flatten()
 }
 
 /// Determine if a module should be skipped. True if the module should be skipped, false otherwise.
