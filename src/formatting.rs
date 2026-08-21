@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 use std::io::{self, Write};
+use std::path::Path;
 use std::time::{Duration, Instant};
 
 use rustc_ast::ast;
@@ -14,7 +15,7 @@ use crate::config::{Config, FileName, Verbosity};
 use crate::formatting::generated::is_generated_file;
 use crate::modules::Module;
 use crate::parse::parser::{DirectoryOwnership, Parser, ParserError};
-use crate::parse::session::ParseSess;
+use crate::parse::session::{FileProbe, ParseSess};
 use crate::utils::{contains_skip, count_newlines};
 use crate::visitor::FmtVisitor;
 use crate::{ErrorKind, FormatReport, Input, Session, modules, source_file};
@@ -110,14 +111,14 @@ fn format_project<T: FormatHandler>(
     let main_file = input.file_name();
     let input_is_stdin = main_file == FileName::Stdin;
 
-    let psess = ParseSess::new(config)?;
+    let psess = ParseSess::new(config, handler.module_graph_enabled())?;
     if config.skip_children() && psess.ignore_file(&main_file) {
         return Ok(FormatReport::new());
     }
 
     // Parse the crate.
     let mut report = FormatReport::new();
-    let directory_ownership = input.to_directory_ownership();
+    let directory_ownership = input.to_directory_ownership(&psess);
 
     let krate = match Parser::parse_crate(input, &psess) {
         Ok(krate) => krate,
@@ -145,6 +146,18 @@ fn format_project<T: FormatHandler>(
             || !should_skip_module(config, &context, input_is_stdin, &main_file, path, module)
     })
     .collect::<Vec<_>>();
+
+    let loaded_sources = context.psess.inner().source_map().files();
+    context.handler.record_module_graph(
+        &main_file,
+        files.iter().map(|(path, _)| path),
+        loaded_sources.iter().map(|source| match &source.name {
+            rustc_span::FileName::Real(path) => path.local_path(),
+            _ => None,
+        }),
+        context.psess.file_probes(),
+    );
+    drop(loaded_sources);
 
     timer = timer.done_parsing();
 
@@ -263,6 +276,18 @@ impl<'a, T: FormatHandler + 'a> FormatContext<'a, T> {
 
 // Handle the results of formatting.
 trait FormatHandler {
+    /// Enables native filesystem recording only for callers requesting an authoritative graph.
+    fn module_graph_enabled(&self) -> bool;
+
+    /// Reports formatted files separately from all parser-loaded sources and resolver probes.
+    fn record_module_graph<'a, 'd>(
+        &mut self,
+        root: &FileName,
+        files: impl Iterator<Item = &'a FileName>,
+        dependencies: impl Iterator<Item = Option<&'d Path>>,
+        probes: Option<Vec<FileProbe>>,
+    );
+
     fn handle_formatted_file(
         &mut self,
         psess: &ParseSess,
@@ -273,6 +298,20 @@ trait FormatHandler {
 }
 
 impl<'b, T: Write + 'b> FormatHandler for Session<'b, T> {
+    fn module_graph_enabled(&self) -> bool {
+        Session::module_graph_enabled(self)
+    }
+
+    fn record_module_graph<'a, 'd>(
+        &mut self,
+        root: &FileName,
+        files: impl Iterator<Item = &'a FileName>,
+        dependencies: impl Iterator<Item = Option<&'d Path>>,
+        probes: Option<Vec<FileProbe>>,
+    ) {
+        Session::record_module_graph(self, root, files, dependencies, probes);
+    }
+
     // Called for each formatted file.
     fn handle_formatted_file(
         &mut self,
