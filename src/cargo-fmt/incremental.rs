@@ -14,7 +14,7 @@ use super::{
     run_rustfmt_with_output, rustfmt_command,
 };
 
-const CACHE_VERSION: u32 = 8;
+const CACHE_VERSION: u32 = 9;
 const MODULE_MANIFEST_VERSION: u32 = 3;
 const MODULE_MANIFEST_SCHEMA: &str = "ohm.rustfmt-files";
 const MODULE_MANIFEST_ENVIRONMENT: &str = "OHM_RUSTFMT_MODULE_MANIFEST";
@@ -1009,9 +1009,7 @@ fn invocation_key(targets: &BTreeSet<Target>, arguments: &[String]) -> io::Resul
     #[cfg(windows)]
     hash_environment(&mut invocation, "PATH")?;
 
-    for argument in arguments {
-        hash_value(&mut invocation, argument);
-    }
+    hash_formatter_arguments(&mut invocation, arguments);
     for target in targets {
         hash_value(&mut invocation, &path_string(&target.path)?);
         hash_value(&mut invocation, &path_string(&target.package_root)?);
@@ -1020,6 +1018,15 @@ fn invocation_key(targets: &BTreeSet<Target>, arguments: &[String]) -> io::Resul
     }
 
     Ok(format!("{:x}", invocation.finalize()))
+}
+
+/// Shares successful read/write proofs without conflating any effective formatting options.
+fn hash_formatter_arguments(invocation: &mut Sha256, arguments: &[String]) {
+    for argument in arguments {
+        if argument != "--check" {
+            hash_value(invocation, argument);
+        }
+    }
 }
 
 /// Consumes every edition manifest after validating roots, loaded sources, and native probes.
@@ -1636,6 +1643,7 @@ fn write_cache(path: &Path, snapshot: &Snapshot) -> io::Result<()> {
 
 /// Conservatively disables caching for output-producing flags and unaudited inline settings.
 fn has_observable_emit_mode(arguments: &[String]) -> bool {
+    let check_only = arguments.iter().any(|argument| argument == "--check");
     let mut arguments = arguments.iter();
     while let Some(argument) = arguments.next() {
         if matches!(
@@ -1663,12 +1671,12 @@ fn has_observable_emit_mode(arguments: &[String]) -> bool {
         {
             return true;
         } else if argument == "--emit" {
-            if arguments.next().is_none_or(|mode| mode != "files") {
+            if check_only || arguments.next().is_none_or(|mode| mode != "files") {
                 return true;
             }
         } else if argument
             .strip_prefix("--emit=")
-            .is_some_and(|mode| mode != "files")
+            .is_some_and(|mode| check_only || mode != "files")
         {
             return true;
         } else if argument == "--config" {
@@ -3177,6 +3185,29 @@ mod tests {
     }
 
     #[test]
+    fn checks_with_explicit_file_emission_bypass_the_cache() {
+        assert!(has_observable_emit_mode(&[
+            String::from("--check"),
+            String::from("--emit"),
+            String::from("files"),
+        ]));
+        assert!(has_observable_emit_mode(&[
+            String::from("--emit"),
+            String::from("files"),
+            String::from("--check"),
+        ]));
+        assert!(has_observable_emit_mode(&[
+            String::from("--check"),
+            String::from("--emit=files"),
+        ]));
+        assert!(!has_observable_emit_mode(&[
+            String::from("--emit"),
+            String::from("files"),
+        ]));
+        assert!(!has_observable_emit_mode(&[String::from("--check")]));
+    }
+
+    #[test]
     fn formatting_only_import_granularity_configuration_can_use_the_cache() {
         for granularity in ["Preserve", "Crate", "Module", "Item", "One"] {
             assert!(!has_observable_emit_mode(&[
@@ -3223,5 +3254,29 @@ mod tests {
             verification_arguments(&[String::from("--check")]),
             vec![String::from("--check")]
         );
+    }
+
+    #[test]
+    fn clean_checks_and_writes_share_only_equivalent_formatter_options() {
+        let identity = |arguments: &[&str]| {
+            let arguments = arguments
+                .iter()
+                .map(|argument| String::from(*argument))
+                .collect::<Vec<_>>();
+            let mut digest = Sha256::new();
+            hash_formatter_arguments(&mut digest, &arguments);
+            digest.finalize()
+        };
+
+        assert_eq!(identity(&[]), identity(&["--check"]));
+        assert_eq!(
+            identity(&["--config", "imports_granularity=Item"]),
+            identity(&["--config", "imports_granularity=Item", "--check"]),
+        );
+        assert_ne!(
+            identity(&["--config", "imports_granularity=Item"]),
+            identity(&["--config", "imports_granularity=Crate"]),
+        );
+        assert_ne!(identity(&["--emit=files"]), identity(&[]));
     }
 }
