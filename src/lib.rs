@@ -444,6 +444,7 @@ pub struct Session<'b, T: Write> {
     source_file: SourceFile,
     emitter: Box<dyn Emitter + 'b>,
     module_graph: Option<ResolvedModuleGraph>,
+    unchanged_leaf: Option<(PathBuf, PathBuf, String)>,
 }
 
 /// Files actually selected by rustfmt's native module resolver for each input.
@@ -456,6 +457,7 @@ struct ResolvedModuleGraph {
 #[derive(Default)]
 struct ResolvedRootFiles {
     files: BTreeSet<PathBuf>,
+    leaves: BTreeMap<PathBuf, String>,
     dependencies: BTreeSet<PathBuf>,
     probes: BTreeMap<PathBuf, FileProbe>,
 }
@@ -472,8 +474,19 @@ struct ModuleGraphManifest<'a> {
 struct ModuleGraphRoot<'a> {
     path: &'a Path,
     files: Vec<&'a Path>,
+    leaves: BTreeMap<&'a Path, &'a str>,
     dependencies: Vec<&'a Path>,
     probes: Vec<&'a FileProbe>,
+}
+
+/// Authorizes a no-rewrite leaf run without pretending to rediscover its siblings.
+#[derive(serde::Serialize)]
+struct LeafFormatCertificate<'a> {
+    schema: &'static str,
+    version: u32,
+    root: &'a Path,
+    leaf: &'a Path,
+    topology: &'a str,
 }
 
 /// Rejects unresolved and non-UTF-8 paths that cannot be represented in a cache manifest.
@@ -506,13 +519,53 @@ impl<'b, T: Write + 'b> Session<'b, T> {
             errors: ReportedErrors::default(),
             source_file: SourceFile::new(),
             module_graph: None,
+            unchanged_leaf: None,
         }
     }
 
     /// The main entry point for Rustfmt. Formats the given input according to the
     /// given config. `out` is only necessary if required by the configuration.
     pub fn format(&mut self, input: Input) -> Result<FormatReport, ErrorKind> {
+        self.unchanged_leaf = None;
         self.format_input_inner(input, false)
+    }
+
+    /// Formats one previously resolved leaf while retaining its actual crate-root context.
+    #[doc(hidden)]
+    pub fn format_leaf(
+        &mut self,
+        root: &Path,
+        leaf: &Path,
+    ) -> Result<Option<FormatReport>, ErrorKind> {
+        self.format_module(root, leaf, &modules::empty_module_topology())
+    }
+
+    /// Formats one direct module only while its authoritative descendant topology matches.
+    #[doc(hidden)]
+    pub fn format_module(
+        &mut self,
+        root: &Path,
+        module: &Path,
+        expected_topology: &str,
+    ) -> Result<Option<FormatReport>, ErrorKind> {
+        self.unchanged_leaf = None;
+        let original = fs::read(module).ok();
+        let report = self.format_leaf_input(root, module, Some(expected_topology))?;
+        if report
+            .as_ref()
+            .is_some_and(|(_, _, emitted_diagnostics)| !emitted_diagnostics)
+            && self.has_no_visible_errors()
+            && original
+                .is_some_and(|original| fs::read(module).is_ok_and(|result| result == original))
+        {
+            self.unchanged_leaf = root
+                .canonicalize()
+                .ok()
+                .zip(module.canonicalize().ok())
+                .zip(report.as_ref().map(|(_, topology, _)| topology.clone()))
+                .map(|((root, module), topology)| (root, module, topology));
+        }
+        Ok(report.map(|(report, _, _)| report))
     }
 
     /// Enables opt-in collection of the exact files selected for each input.
@@ -532,10 +585,11 @@ impl<'b, T: Write + 'b> Session<'b, T> {
     ///
     /// Any incomplete source, missing dependency probe, or conflicting observation disables
     /// manifest publication for the entire formatter invocation.
-    pub(crate) fn record_module_graph<'a, 'd>(
+    pub(crate) fn record_module_graph<'a, 'l, 'd>(
         &mut self,
         root: &FileName,
         files: impl Iterator<Item = &'a FileName>,
+        leaves: impl Iterator<Item = (&'l FileName, String)>,
         dependencies: impl Iterator<Item = Option<&'d Path>>,
         probes: Option<Vec<FileProbe>>,
     ) {
@@ -554,6 +608,16 @@ impl<'b, T: Write + 'b> Session<'b, T> {
             FileName::Real(path) => Some(path.as_path()),
             _ => None,
         })) else {
+            graph.complete = false;
+            return;
+        };
+        let Some(resolved_leaves) = leaves
+            .map(|(file, topology)| match file {
+                FileName::Real(path) => canonical_graph_path(path).map(|path| (path, topology)),
+                _ => None,
+            })
+            .collect::<Option<BTreeMap<_, _>>>()
+        else {
             graph.complete = false;
             return;
         };
@@ -591,6 +655,9 @@ impl<'b, T: Write + 'b> Session<'b, T> {
         }
 
         if !resolved_files.contains(&root)
+            || resolved_leaves
+                .keys()
+                .any(|path| !resolved_files.contains(path))
             || !resolved_files.is_subset(&loaded_dependencies)
             || !loaded_dependencies.is_subset(&observed_dependencies)
         {
@@ -599,6 +666,7 @@ impl<'b, T: Write + 'b> Session<'b, T> {
         }
         let resolved = graph.roots.entry(root).or_default();
         resolved.files.extend(resolved_files);
+        resolved.leaves.extend(resolved_leaves);
         resolved.dependencies.extend(loaded_dependencies);
         for (path, probe) in resolved_probes {
             if let Some(previous) = resolved.probes.insert(path, probe.clone()) {
@@ -629,32 +697,60 @@ impl<'b, T: Write + 'b> Session<'b, T> {
 
         let manifest = ModuleGraphManifest {
             schema: "ohm.rustfmt-files",
-            version: 1,
+            version: 3,
             roots: graph
                 .roots
                 .iter()
                 .map(|(root, resolved)| ModuleGraphRoot {
                     path: root,
                     files: resolved.files.iter().map(PathBuf::as_path).collect(),
+                    leaves: resolved
+                        .leaves
+                        .iter()
+                        .map(|(path, topology)| (path.as_path(), topology.as_str()))
+                        .collect(),
                     dependencies: resolved.dependencies.iter().map(PathBuf::as_path).collect(),
                     probes: resolved.probes.values().collect(),
                 })
                 .collect(),
         };
-        let temporary = path.with_extension(format!("{}.tmp", std::process::id()));
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temporary)?;
-        let result = (|| {
-            serde_json::to_writer(&mut file, &manifest).map_err(io::Error::other)?;
-            file.flush()?;
-            fs::rename(&temporary, path)
-        })();
-        if result.is_err() {
-            let _ = fs::remove_file(&temporary);
+        write_authoritative_manifest(path, &manifest)
+    }
+
+    /// Publishes proof that a context-preserving leaf was already correctly formatted.
+    #[doc(hidden)]
+    pub fn write_leaf_certificate(
+        &self,
+        path: &Path,
+        root: &Path,
+        leaf: &Path,
+        topology: &str,
+    ) -> io::Result<()> {
+        if !self.has_no_visible_errors() {
+            return Err(io::Error::other(
+                "the incremental leaf format was not clean",
+            ));
         }
-        result
+        let root = root.canonicalize()?;
+        let leaf = leaf.canonicalize()?;
+        if root == leaf
+            || self.unchanged_leaf.as_ref()
+                != Some(&(root.clone(), leaf.clone(), String::from(topology)))
+        {
+            return Err(io::Error::other(
+                "the incremental leaf was not proven unchanged",
+            ));
+        }
+        write_authoritative_manifest(
+            path,
+            &LeafFormatCertificate {
+                schema: "ohm.rustfmt-leaf",
+                version: 2,
+                root: &root,
+                leaf: &leaf,
+                topology,
+            },
+        )
     }
 
     pub fn override_config<F, U>(&mut self, mut config: Config, f: F) -> U
@@ -695,6 +791,17 @@ impl<'b, T: Write + 'b> Session<'b, T> {
         self.errors.has_unformatted_code_errors
     }
 
+    /// Excludes silent macro-rewrite fallbacks, matching rustfmt's public success status.
+    #[doc(hidden)]
+    pub fn has_no_visible_errors(&self) -> bool {
+        !(self.has_operational_errors()
+            || self.has_parsing_errors()
+            || self.has_formatting_errors()
+            || self.has_check_errors()
+            || self.has_diff()
+            || self.has_unformatted_code_errors())
+    }
+
     pub fn has_no_errors(&self) -> bool {
         !(self.has_operational_errors()
             || self.has_parsing_errors()
@@ -704,6 +811,25 @@ impl<'b, T: Write + 'b> Session<'b, T> {
             || self.has_unformatted_code_errors()
             || self.errors.has_macro_format_failure)
     }
+}
+
+/// Publishes private formatter handoffs through a same-directory atomic rename.
+fn write_authoritative_manifest<T: serde::Serialize>(path: &Path, manifest: &T) -> io::Result<()> {
+    let temporary = path.with_extension(format!("{}.tmp", std::process::id()));
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)?;
+    let result = (|| {
+        let contents = serde_json::to_vec(&manifest).map_err(io::Error::other)?;
+        file.write_all(&contents)?;
+        file.flush()?;
+        fs::rename(&temporary, path)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
 }
 
 pub(crate) fn create_emitter<'a>(config: &Config) -> Box<dyn Emitter + 'a> {
@@ -790,6 +916,9 @@ mod unit_tests {
                 FileName::Real(second_root.clone()),
             ]
             .iter(),
+            [FileName::Real(shared_module.clone())]
+                .iter()
+                .map(|path| (path, modules::empty_module_topology())),
             [&second_root, &shared_module]
                 .into_iter()
                 .map(|path| Some(path.as_path())),
@@ -815,6 +944,9 @@ mod unit_tests {
                 FileName::Real(first_root.clone()),
             ]
             .iter(),
+            [FileName::Real(shared_module.clone())]
+                .iter()
+                .map(|path| (path, modules::empty_module_topology())),
             [&first_root, &shared_module]
                 .into_iter()
                 .map(|path| Some(path.as_path())),
@@ -840,7 +972,7 @@ mod unit_tests {
             serde_json::from_slice(&fs::read(manifest_path)?).map_err(io::Error::other)?;
 
         assert_eq!(manifest["schema"], "ohm.rustfmt-files");
-        assert_eq!(manifest["version"], 1);
+        assert_eq!(manifest["version"], 3);
         assert_eq!(
             manifest["roots"][0]["path"],
             first_root.canonicalize()?.to_string_lossy().as_ref()
@@ -854,6 +986,12 @@ mod unit_tests {
                 .as_array()
                 .map(Vec::len),
             Some(2)
+        );
+        assert_eq!(
+            manifest["roots"][0]["leaves"]
+                .as_object()
+                .map(serde_json::Map::len),
+            Some(1)
         );
         assert_eq!(
             manifest["roots"][0]["probes"].as_array().map(Vec::len),
@@ -950,6 +1088,379 @@ mod unit_tests {
         Ok(())
     }
 
+    #[test]
+    fn direct_leaf_formatting_preserves_crate_root_skip_attributes() -> io::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let root = directory.path().join("lib.rs");
+        let leaf = directory.path().join("child.rs");
+        fs::write(&root, "#![rustfmt::skip::macros(example)]\nmod child;\n")?;
+        let source = "fn child() {\n    example!( a,     b );\n}\n";
+        fs::write(&leaf, source)?;
+
+        let mut configuration = Config::default();
+        configuration.set().emit_mode(EmitMode::Files);
+        let mut output = Vec::new();
+        let mut session = Session::new(configuration, Some(&mut output));
+        let report = session
+            .format_leaf(&root, &leaf)
+            .map_err(io::Error::other)?;
+
+        assert!(report.is_some());
+        assert!(session.has_no_errors());
+        assert_eq!(fs::read_to_string(&leaf)?, source);
+        let certificate = directory.path().join("leaf.json");
+        session.write_leaf_certificate(
+            &certificate,
+            &root,
+            &leaf,
+            &modules::empty_module_topology(),
+        )?;
+        let certificate: serde_json::Value =
+            serde_json::from_slice(&fs::read(certificate)?).map_err(io::Error::other)?;
+        assert_eq!(certificate["schema"], "ohm.rustfmt-leaf");
+        Ok(())
+    }
+
+    #[test]
+    fn changed_leaf_falls_back_before_rewriting_or_certifying() -> io::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let root = directory.path().join("lib.rs");
+        let leaf = directory.path().join("child.rs");
+        fs::write(&root, "mod child;\n")?;
+        fs::write(&leaf, "fn child( ){ }\n")?;
+
+        let mut configuration = Config::default();
+        configuration.set().emit_mode(EmitMode::Files);
+        let mut output = Vec::new();
+        let mut session = Session::new(configuration, Some(&mut output));
+        assert!(
+            session
+                .format_leaf(&root, &leaf)
+                .map_err(io::Error::other)?
+                .is_none()
+        );
+        assert_eq!(fs::read_to_string(&leaf)?, "fn child( ){ }\n");
+        assert!(
+            session
+                .write_leaf_certificate(
+                    &directory.path().join("leaf.json"),
+                    &root,
+                    &leaf,
+                    &modules::empty_module_topology(),
+                )
+                .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn direct_leaf_unchanged_detection_preserves_effective_newline_styles() -> io::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let root = directory.path().join("lib.rs");
+        let leaf = directory.path().join("child.rs");
+        fs::write(&root, "mod child;\n")?;
+
+        for (style, source, unchanged) in [
+            (NewlineStyle::Auto, "fn child() {}\n", true),
+            (NewlineStyle::Auto, "fn child() {}\r\n", true),
+            (NewlineStyle::Unix, "fn child() {}\n", true),
+            (NewlineStyle::Windows, "fn child() {}\r\n", true),
+            (NewlineStyle::Unix, "fn child() {}\r\n", false),
+            (NewlineStyle::Windows, "fn child() {}\n", false),
+        ] {
+            fs::write(&leaf, source)?;
+            let mut configuration = Config::default();
+            configuration.set().emit_mode(EmitMode::Files);
+            configuration.set().newline_style(style);
+            let mut output = Vec::new();
+            let mut session = Session::new(configuration, Some(&mut output));
+
+            let formatted = session
+                .format_leaf(&root, &leaf)
+                .map_err(io::Error::other)?;
+
+            assert_eq!(formatted.is_some(), unchanged, "newline style: {style:?}");
+            assert_eq!(fs::read_to_string(&leaf)?, source);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn malformed_direct_module_falls_back_without_polluting_the_session() -> io::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let root = directory.path().join("lib.rs");
+        let leaf = directory.path().join("child.rs");
+        fs::write(&root, "mod child;\n")?;
+        fs::write(&leaf, "fn child( {\n")?;
+
+        let mut output = Vec::new();
+        let mut session = Session::new(Config::default(), Some(&mut output));
+        assert!(
+            session
+                .format_leaf(&root, &leaf)
+                .map_err(io::Error::other)?
+                .is_none()
+        );
+        assert!(session.has_no_errors());
+
+        let error = match session.format(Input::File(root)) {
+            Ok(_) => {
+                return Err(io::Error::other(
+                    "the native resolver did not report the malformed module",
+                ));
+            }
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("failed to resolve mod `child`"));
+        Ok(())
+    }
+
+    #[test]
+    fn silent_tracing_macro_fallback_can_certify_an_unchanged_direct_module() -> io::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let root = directory.path().join("lib.rs");
+        let leaf = directory.path().join("child.rs");
+        fs::write(&root, "mod child;\n")?;
+        let source = "fn child() {\n    tracing::trace!(%error, \"failed\");\n}\n";
+        fs::write(&leaf, source)?;
+
+        let mut configuration = Config::default();
+        configuration.set().emit_mode(EmitMode::Files);
+        let mut output = Vec::new();
+        let mut session = Session::new(configuration, Some(&mut output));
+        assert!(
+            session
+                .format_leaf(&root, &leaf)
+                .map_err(io::Error::other)?
+                .is_some()
+        );
+        assert!(!session.has_no_errors());
+        assert!(session.has_no_visible_errors());
+        assert_eq!(fs::read_to_string(&leaf)?, source);
+        session.write_leaf_certificate(
+            &directory.path().join("leaf.json"),
+            &root,
+            &leaf,
+            &modules::empty_module_topology(),
+        )?;
+        Ok(())
+    }
+
+    #[test]
+    fn forwarded_parser_warning_never_receives_an_incremental_certificate() -> io::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let root = directory.path().join("lib.rs");
+        let leaf = directory.path().join("child.rs");
+        fs::write(&root, "mod child;\n")?;
+        fs::write(
+            &leaf,
+            "fn child() {\n    let _ = \"\\\n\n             \";\n}\n",
+        )?;
+
+        let mut configuration = Config::default();
+        configuration.set().emit_mode(EmitMode::Files);
+        let mut output = Vec::new();
+        let mut session = Session::new(configuration, Some(&mut output));
+        assert!(
+            session
+                .format_leaf(&root, &leaf)
+                .map_err(io::Error::other)?
+                .is_none()
+        );
+        assert!(session.has_no_errors());
+        assert!(
+            session
+                .write_leaf_certificate(
+                    &directory.path().join("leaf.json"),
+                    &root,
+                    &leaf,
+                    &modules::empty_module_topology(),
+                )
+                .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn direct_module_preserves_authoritative_cfg_and_path_child_topology() -> io::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let root = directory.path().join("lib.rs");
+        let module = directory.path().join("child.rs");
+        let tests = directory.path().join("child_tests.rs");
+        fs::write(&root, "mod child;\n")?;
+        fs::write(
+            &module,
+            "fn child() {}\n\n#[cfg(test)]\n#[path = \"child_tests.rs\"]\nmod tests;\n",
+        )?;
+        fs::write(&tests, "#[test]\nfn child_test() {}\n")?;
+
+        let mut configuration = Config::default();
+        configuration.set().emit_mode(EmitMode::Files);
+        let mut first_output = Vec::new();
+        let mut discovery = Session::new(configuration.clone(), Some(&mut first_output));
+        discovery.enable_module_graph();
+        discovery
+            .format(Input::File(root.clone()))
+            .map_err(io::Error::other)?;
+        let manifest = directory.path().join("modules.json");
+        discovery.write_module_manifest(&manifest, std::slice::from_ref(&root))?;
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&fs::read(manifest)?).map_err(io::Error::other)?;
+        let key = module.canonicalize()?.to_string_lossy().into_owned();
+        let topology = manifest["roots"][0]["leaves"][&key]
+            .as_str()
+            .ok_or_else(|| io::Error::other("direct-module topology was not recorded"))?
+            .to_owned();
+
+        let mut second_output = Vec::new();
+        let mut formatting = Session::new(configuration.clone(), Some(&mut second_output));
+        assert!(
+            formatting
+                .format_module(&root, &module, &topology)
+                .map_err(io::Error::other)?
+                .is_some()
+        );
+        formatting.write_leaf_certificate(
+            &directory.path().join("leaf.json"),
+            &root,
+            &module,
+            &topology,
+        )?;
+
+        fs::write(
+            &module,
+            "fn child() {}\n\n#[cfg(not(test))]\n#[path = \"child_tests.rs\"]\nmod tests;\n",
+        )?;
+        let mut third_output = Vec::new();
+        let mut changed = Session::new(configuration, Some(&mut third_output));
+        assert!(
+            changed
+                .format_module(&root, &module, &topology)
+                .map_err(io::Error::other)?
+                .is_none()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn nested_or_annotated_module_ownership_is_never_formatted_as_a_leaf() -> io::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let root = directory.path().join("lib.rs");
+        let parent = directory.path().join("parent.rs");
+        let nested_directory = directory.path().join("parent");
+        fs::create_dir_all(&nested_directory)?;
+        let nested = nested_directory.join("child.rs");
+        fs::write(&root, "mod parent;\n")?;
+        fs::write(&parent, "mod child;\n")?;
+        fs::write(&nested, "fn child() {}\n")?;
+
+        let mut output = Vec::new();
+        let mut session = Session::new(Config::default(), Some(&mut output));
+        assert!(
+            session
+                .format_leaf(&root, &nested)
+                .map_err(io::Error::other)?
+                .is_none()
+        );
+
+        let direct = directory.path().join("child.rs");
+        fs::write(&direct, "fn child() {}\n")?;
+        for declaration in [
+            "#[cfg(test)]\nmod child;\n",
+            "#[rustfmt::skip]\nmod child;\n",
+            "#[path = \"child.rs\"]\nmod child;\n",
+        ] {
+            fs::write(&root, declaration)?;
+            assert!(
+                session
+                    .format_leaf(&root, &direct)
+                    .map_err(io::Error::other)?
+                    .is_none()
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn introducing_a_child_module_invalidates_the_direct_leaf_fast_path() -> io::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let root = directory.path().join("lib.rs");
+        let leaf = directory.path().join("child.rs");
+        fs::write(&root, "mod child;\n")?;
+        fs::write(&leaf, "mod nested;\n")?;
+
+        let mut output = Vec::new();
+        let mut session = Session::new(Config::default(), Some(&mut output));
+        assert!(
+            session
+                .format_leaf(&root, &leaf)
+                .map_err(io::Error::other)?
+                .is_none()
+        );
+        assert_eq!(fs::read_to_string(&leaf)?, "mod nested;\n");
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn direct_symlink_modules_retain_their_native_logical_backup_paths() -> io::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let root = directory.path().join("lib.rs");
+        let linked = directory.path().join("child.rs");
+        let external_directory = directory.path().join("external");
+        fs::create_dir(&external_directory)?;
+        let external = external_directory.join("child.rs");
+        fs::write(&root, "mod child;\n")?;
+        fs::write(&external, "fn child() {}\n")?;
+        std::os::unix::fs::symlink(&external, &linked)?;
+
+        let mut configuration = Config::default();
+        configuration.set().emit_mode(EmitMode::Files);
+        let mut discovery_output = Vec::new();
+        let mut discovery = Session::new(configuration.clone(), Some(&mut discovery_output));
+        discovery.enable_module_graph();
+        discovery
+            .format(Input::File(root.clone()))
+            .map_err(io::Error::other)?;
+        let manifest_path = directory.path().join("modules.json");
+        discovery.write_module_manifest(&manifest_path, std::slice::from_ref(&root))?;
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&fs::read(manifest_path)?).map_err(io::Error::other)?;
+        assert!(
+            manifest["roots"][0]["leaves"]
+                .as_object()
+                .is_some_and(serde_json::Map::is_empty)
+        );
+
+        let source = "fn child( ){ }\n";
+        fs::write(&external, source)?;
+        configuration.set().make_backup(true);
+        let mut output = Vec::new();
+        let mut session = Session::new(configuration, Some(&mut output));
+        assert!(
+            session
+                .format_leaf(&root, &external)
+                .map_err(io::Error::other)?
+                .is_none()
+        );
+        assert_eq!(fs::read_to_string(&external)?, source);
+        assert!(fs::symlink_metadata(&linked)?.file_type().is_symlink());
+
+        session
+            .format(Input::File(root))
+            .map_err(io::Error::other)?;
+        assert!(!fs::symlink_metadata(&linked)?.file_type().is_symlink());
+        assert!(
+            fs::symlink_metadata(linked.with_extension("bk"))?
+                .file_type()
+                .is_symlink()
+        );
+        assert!(!external.with_extension("bk").exists());
+        assert_eq!(fs::read_to_string(&external)?, source);
+        assert_eq!(fs::read_to_string(&linked)?, "fn child() {}\n");
+        Ok(())
+    }
+
     #[cfg(unix)]
     #[test]
     fn module_manifest_preserves_logical_symlink_probes() -> io::Result<()> {
@@ -1030,6 +1541,7 @@ mod unit_tests {
         session.record_module_graph(
             &FileName::Real(root.clone()),
             [FileName::Real(module)].iter(),
+            std::iter::empty(),
             [root.as_path()].into_iter().map(Some),
             Some(vec![FileProbe {
                 path: root.clone(),
