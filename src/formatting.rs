@@ -13,7 +13,7 @@ use tracing::debug;
 
 use self::newline_style::apply_newline_style;
 use crate::comment::{CharClasses, FullCodeCharKind};
-use crate::config::{Config, FileName, Verbosity};
+use crate::config::{Config, EmitMode, FileName, Verbosity};
 use crate::formatting::generated::is_generated_file;
 use crate::modules::Module;
 use crate::parse::parser::{DirectoryOwnership, Parser, ParserError};
@@ -557,6 +557,11 @@ impl<'b, T: Write + 'b> FormatHandler for Session<'b, T> {
         report: &mut FormatReport,
     ) -> Result<(), ErrorKind> {
         if let Some(ref mut out) = self.out {
+            let unchanged = self.config.emit_mode() != EmitMode::Files
+                || (self.config.newline_style() == NewlineStyle::Auto
+                    && psess
+                        .get_original_snippet(&path)
+                        .is_some_and(|original| original.as_str() == result));
             match source_file::write_file(
                 Some(psess),
                 &path,
@@ -573,6 +578,7 @@ impl<'b, T: Write + 'b> FormatHandler for Session<'b, T> {
                 }
                 _ => {}
             }
+            self.rewritten_sources |= !unchanged;
         }
 
         self.source_file.push((path, result));
