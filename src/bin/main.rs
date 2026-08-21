@@ -349,13 +349,20 @@ fn format(
     let mut session = Session::new(config, Some(out));
     let module_manifest = env::var_os(MODULE_MANIFEST_ENVIRONMENT).map(PathBuf::from);
     let expected_roots = module_manifest.as_ref().map(|_| files.clone());
-    let changed_module = module_manifest
+    let changed_modules = module_manifest
         .as_ref()
         .filter(|_| files.len() == 1)
-        .and_then(|_| env::var_os(CHANGED_MODULE_ENVIRONMENT))
-        .map(PathBuf::from)
-        .zip(env::var(MODULE_TOPOLOGY_ENVIRONMENT).ok());
-    let mut certified_leaf = None;
+        .and_then(|_| {
+            let paths = env::var_os(CHANGED_MODULE_ENVIRONMENT)?;
+            let topologies = env::var(MODULE_TOPOLOGY_ENVIRONMENT).ok()?;
+            let paths = env::split_paths(&paths).collect::<Vec<_>>();
+            let topologies = topologies.split(',').map(String::from).collect::<Vec<_>>();
+            if paths.is_empty() || paths.len() != topologies.len() {
+                return None;
+            }
+            Some(paths.into_iter().zip(topologies).collect::<Vec<_>>())
+        });
+    let mut certified_leaves = None;
     if module_manifest.is_some() {
         session.enable_module_graph();
     }
@@ -382,23 +389,11 @@ fn format(
                     }
                 }
 
-                certified_leaf = session.override_config(local_config, |session| {
-                    format_target(
-                        session,
-                        file,
-                        changed_module
-                            .as_ref()
-                            .map(|(module, topology)| (module.as_path(), topology.as_str())),
-                    )
+                certified_leaves = session.override_config(local_config, |session| {
+                    format_targets(session, file, changed_modules.as_deref())
                 });
             } else {
-                certified_leaf = format_target(
-                    &mut session,
-                    file,
-                    changed_module
-                        .as_ref()
-                        .map(|(module, topology)| (module.as_path(), topology.as_str())),
-                );
+                certified_leaves = format_targets(&mut session, file, changed_modules.as_deref());
             }
         }
     }
@@ -424,13 +419,41 @@ fn format(
         // formatting. They must never change rustfmt's diagnostics or status.
         // Some macro rewrites intentionally fail silently without affecting
         // rustfmt's successful public exit status.
-        if let Some((root, leaf, topology)) = certified_leaf {
-            let _ = session.write_leaf_certificate(&path, &root, &leaf, &topology);
+        if let Some(leaves) = certified_leaves {
+            if let Some((root, _, _)) = leaves.first() {
+                let modules = leaves
+                    .iter()
+                    .map(|(_, leaf, topology)| (leaf.clone(), topology.clone()))
+                    .collect::<Vec<_>>();
+                let _ = session.write_leaf_certificates(&path, root, &modules);
+            }
         } else {
             let _ = session.write_module_manifest(&path, &roots);
         }
     }
     Ok(exit_code)
+}
+
+/// Formats every certified direct child without silently authorizing an uncertified sibling.
+fn format_targets<T: Write>(
+    session: &mut Session<'_, T>,
+    root: PathBuf,
+    modules: Option<&[(PathBuf, String)]>,
+) -> Option<Vec<(PathBuf, PathBuf, String)>> {
+    let Some(modules) = modules else {
+        format_target(session, root, None);
+        return None;
+    };
+
+    let mut certified = Vec::with_capacity(modules.len());
+    for (module, topology) in modules {
+        certified.push(format_target(
+            session,
+            root.clone(),
+            Some((module, topology)),
+        )?);
+    }
+    Some(certified)
 }
 
 /// Falls back before modifying files whenever a requested leaf loses its root context.
