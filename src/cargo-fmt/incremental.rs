@@ -21,7 +21,7 @@ const MODULE_MANIFEST_ENVIRONMENT: &str = "OHM_RUSTFMT_MODULE_MANIFEST";
 const CHANGED_MODULE_ENVIRONMENT: &str = "OHM_RUSTFMT_CHANGED_MODULE";
 const MODULE_TOPOLOGY_ENVIRONMENT: &str = "OHM_RUSTFMT_MODULE_TOPOLOGY";
 const LEAF_CERTIFICATE_SCHEMA: &str = "ohm.rustfmt-leaf";
-const LEAF_CERTIFICATE_VERSION: u32 = 2;
+const LEAF_CERTIFICATE_VERSION: u32 = 3;
 const ENABLE_ENVIRONMENT: &str = "OHM_INCREMENTAL_FMT";
 const CACHE_ENVIRONMENT: &str = "OHM_INCREMENTAL_FMT_CACHE_DIR";
 const TRACE_ENVIRONMENT: &str = "OHM_INCREMENTAL_FMT_TRACE";
@@ -181,13 +181,19 @@ struct Discovery {
     probes: ProbeGraph,
 }
 
-/// Identifies a clean, context-preserving formatter run over exactly one leaf.
+/// Identifies a clean, context-preserving formatter run over verified direct leaves.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct LeafCertificate {
     schema: String,
     version: u32,
     root: String,
+    leaves: Vec<CertifiedLeaf>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CertifiedLeaf {
     leaf: String,
     topology: String,
 }
@@ -297,41 +303,61 @@ pub(super) fn format(
         trace("falling back to complete formatting for an invalid cache path");
         return run_rustfmt(targets, arguments, verbosity);
     };
-    let changed_leaf = plan.changed_leaf(&changed_roots);
+    let changed_leaves = plan
+        .changed_leaves(&changed_roots)
+        .filter(|leaves| env::join_paths(leaves.iter().map(|leaf| Path::new(&leaf.path))).is_ok());
+    let requested_modules = changed_leaves.as_ref().map(|leaves| {
+        leaves
+            .iter()
+            .map(|leaf| (PathBuf::from(&leaf.path), leaf.topology.clone()))
+            .collect::<Vec<_>>()
+    });
+    let batch = changed_leaves
+        .as_ref()
+        .is_some_and(|leaves| leaves.len() > 1);
     let mut output = run_rustfmt_with_output(
         &changed_targets,
         arguments,
         verbosity,
-        RustfmtOutputMode::Inherit,
+        if batch {
+            RustfmtOutputMode::CaptureQuietly
+        } else {
+            RustfmtOutputMode::Inherit
+        },
         Some(cache_directory),
-        changed_leaf
-            .as_ref()
-            .map(|leaf| (Path::new(&leaf.path), leaf.topology.as_str())),
+        requested_modules.as_deref(),
     )?;
     if output.status != SUCCESS {
+        if batch {
+            trace("reformatting the complete target after an unsuccessful leaf batch");
+            return run_rustfmt(&changed_targets, arguments, verbosity);
+        }
         trace("retaining the previous cache after unsuccessful formatting");
         return Ok(output.status);
     }
 
-    if let Some(leaf) = changed_leaf.as_ref() {
+    if let Some(leaves) = changed_leaves.as_ref() {
         if !output.emitted_diagnostics
-            && read_leaf_certificate(&output.module_manifests, leaf).is_ok()
+            && read_leaf_certificate(&output.module_manifests, leaves).is_ok()
         {
             let modules = plan.current.module_graph();
-            let leaves = plan.current.leaf_graph();
+            let leaf_graph = plan.current.leaf_graph();
             let probes = plan.current.probe_graph();
             match Snapshot::capture(
                 targets,
                 arguments,
                 manifest_path,
                 &modules,
-                &leaves,
+                &leaf_graph,
                 &probes,
                 None,
                 Some(&plan.current),
             ) {
                 Ok(updated) if updated == plan.current => {
-                    trace(&format!("formatted unchanged direct leaf {}", leaf.path));
+                    trace(&format!(
+                        "formatted {} unchanged direct leaves",
+                        leaves.len()
+                    ));
                     if let Err(error) = write_cache(&plan.cache_path, &updated) {
                         trace(&format!("could not update the formatting cache: {error}"));
                     }
@@ -354,7 +380,7 @@ pub(super) fn format(
     let mut discovered = match read_module_manifests(&output.module_manifests, &changed_targets) {
         Ok(discovered) => discovered,
         Err(error) => {
-            if changed_leaf.is_some() {
+            if changed_leaves.is_some() {
                 trace(&format!(
                     "reformatting the complete target without an authoritative leaf proof: {error}"
                 ));
@@ -489,7 +515,7 @@ pub(super) fn format(
 }
 
 /// Consumes only a regular, exact-root certificate published by the trusted formatter.
-fn read_leaf_certificate(paths: &[PathBuf], selected: &ChangedLeaf) -> io::Result<()> {
+fn read_leaf_certificate(paths: &[PathBuf], selected: &[ChangedLeaf]) -> io::Result<()> {
     let [path] = paths else {
         return Err(unsupported(
             "an incremental leaf needs exactly one certificate",
@@ -504,12 +530,21 @@ fn read_leaf_certificate(paths: &[PathBuf], selected: &ChangedLeaf) -> io::Resul
     let certificate: LeafCertificate = serde_json::from_reader(file).map_err(io::Error::other)?;
     if certificate.schema != LEAF_CERTIFICATE_SCHEMA
         || certificate.version != LEAF_CERTIFICATE_VERSION
-        || certificate.root != selected.root
-        || certificate.leaf != selected.path
-        || certificate.topology != selected.topology
-        || !valid_topology_digest(&certificate.topology)
+        || selected.is_empty()
+        || selected.iter().any(|leaf| leaf.root != certificate.root)
+        || certificate.leaves.len() != selected.len()
+        || certificate
+            .leaves
+            .iter()
+            .zip(selected)
+            .any(|(proof, leaf)| {
+                proof.leaf != leaf.path
+                    || proof.topology != leaf.topology
+                    || !valid_topology_digest(&proof.topology)
+                    || !canonical_module_path(&proof.leaf)
+                        .is_ok_and(|canonical| canonical == Path::new(&proof.leaf))
+            })
         || canonical_module_path(&certificate.root)? != Path::new(&certificate.root)
-        || canonical_module_path(&certificate.leaf)? != Path::new(&certificate.leaf)
     {
         return Err(unsupported(
             "the incremental leaf certificate does not match its target",
@@ -761,8 +796,8 @@ impl Plan {
         }
     }
 
-    /// Selects one previously verified direct leaf with no alternate owner or graph change.
-    fn changed_leaf(&self, changed_roots: &BTreeSet<&str>) -> Option<ChangedLeaf> {
+    /// Selects verified direct leaves with no alternate owners or source-graph changes.
+    fn changed_leaves(&self, changed_roots: &BTreeSet<&str>) -> Option<Vec<ChangedLeaf>> {
         if changed_roots.len() != 1 {
             return None;
         }
@@ -787,29 +822,36 @@ impl Plan {
             return None;
         }
 
-        let mut changes = current_sources
+        let changes = current_sources
             .iter()
-            .filter(|(path, fingerprint)| previous_sources.get(*path) != Some(*fingerprint));
-        let (path, _) = changes.next()?;
-        if changes.next().is_some()
-            || path == &root
-            || !previous_package.leaves.get(&root)?.contains_key(path)
+            .filter(|(path, fingerprint)| previous_sources.get(*path) != Some(*fingerprint))
+            .map(|(path, _)| {
+                if path == &root {
+                    return None;
+                }
+                let topology = previous_package.leaves.get(&root)?.get(path)?.clone();
+                let owners = self
+                    .current
+                    .packages
+                    .values()
+                    .flat_map(|package| package.targets.values())
+                    .filter(|sources| sources.contains_key(path))
+                    .count();
+                (owners == 1).then(|| ChangedLeaf {
+                    root: root.clone(),
+                    path: path.clone(),
+                    topology,
+                })
+            })
+            .collect::<Option<Vec<_>>>()?;
+        // Every selected leaf still validates its crate-root context. Avoid
+        // batching when too few untouched siblings remain to repay that work.
+        if changes.is_empty()
+            || (changes.len() > 1 && current_sources.len() < changes.len().saturating_mul(3))
         {
             return None;
         }
-        let owners = self
-            .current
-            .packages
-            .values()
-            .flat_map(|package| package.targets.values())
-            .filter(|sources| sources.contains_key(path))
-            .count();
-        let topology = previous_package.leaves.get(&root)?.get(path)?.clone();
-        (owners == 1).then(|| ChangedLeaf {
-            root,
-            path: path.clone(),
-            topology,
-        })
+        Some(changes)
     }
 
     /// Rejects concurrent source/configuration changes while allowing newly discovered configs.
@@ -2067,17 +2109,67 @@ mod tests {
         let plan = plan(Some(previous), current);
 
         assert_eq!(
-            plan.changed_leaf(&plan.changed_targets()),
-            Some(ChangedLeaf {
+            plan.changed_leaves(&plan.changed_targets()),
+            Some(vec![ChangedLeaf {
                 root: String::from("/workspace/first/src/lib.rs"),
                 path: String::from(leaf),
                 topology: format!("{:064x}", 1),
-            })
+            }])
         );
     }
 
     #[test]
-    fn roots_nested_modules_and_multiple_edits_never_use_leaf_formatting() {
+    fn multiple_authoritative_direct_leaves_share_one_unchanged_root() {
+        let package = "/workspace/first";
+        let first = "/workspace/first/src/first.rs";
+        let second = "/workspace/first/src/second.rs";
+        let mut previous = snapshot(&[(
+            package,
+            &[
+                ("src/lib.rs", "root"),
+                ("src/first.rs", "before"),
+                ("src/second.rs", "before"),
+                ("src/unchanged_first.rs", "unchanged"),
+                ("src/unchanged_second.rs", "unchanged"),
+                ("src/unchanged_third.rs", "unchanged"),
+            ],
+        )]);
+        let mut current = snapshot(&[(
+            package,
+            &[
+                ("src/lib.rs", "root"),
+                ("src/first.rs", "after"),
+                ("src/second.rs", "after"),
+                ("src/unchanged_first.rs", "unchanged"),
+                ("src/unchanged_second.rs", "unchanged"),
+                ("src/unchanged_third.rs", "unchanged"),
+            ],
+        )]);
+        for leaf in [first, second] {
+            authorize_leaf(&mut previous, package, leaf);
+            authorize_leaf(&mut current, package, leaf);
+        }
+        let plan = plan(Some(previous), current);
+
+        assert_eq!(
+            plan.changed_leaves(&plan.changed_targets()),
+            Some(vec![
+                ChangedLeaf {
+                    root: String::from("/workspace/first/src/lib.rs"),
+                    path: String::from(first),
+                    topology: format!("{:064x}", 1),
+                },
+                ChangedLeaf {
+                    root: String::from("/workspace/first/src/lib.rs"),
+                    path: String::from(second),
+                    topology: format!("{:064x}", 1),
+                },
+            ]),
+        );
+    }
+
+    #[test]
+    fn roots_nested_modules_and_uncertified_edits_never_use_leaf_formatting() {
         let package = "/workspace/first";
         let leaf = "/workspace/first/src/child.rs";
         let mut previous = snapshot(&[(
@@ -2099,7 +2191,7 @@ mod tests {
 
         assert!(
             plan(Some(previous.clone()), current.clone())
-                .changed_leaf(&BTreeSet::from(["/workspace/first/src/lib.rs"]))
+                .changed_leaves(&BTreeSet::from(["/workspace/first/src/lib.rs"]))
                 .is_none()
         );
 
@@ -2117,7 +2209,7 @@ mod tests {
         }
         assert!(
             plan(Some(previous), current)
-                .changed_leaf(&BTreeSet::from(["/workspace/first/src/lib.rs"]))
+                .changed_leaves(&BTreeSet::from(["/workspace/first/src/lib.rs"]))
                 .is_none()
         );
     }
@@ -2150,7 +2242,7 @@ mod tests {
             authorize_leaf(&mut current, package, leaf);
         }
         let plan = plan(Some(previous), current);
-        assert!(plan.changed_leaf(&plan.changed_targets()).is_none());
+        assert!(plan.changed_leaves(&plan.changed_targets()).is_none());
     }
 
     #[test]
