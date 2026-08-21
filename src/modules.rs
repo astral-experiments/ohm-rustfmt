@@ -6,6 +6,7 @@ use rustc_ast::ast;
 use rustc_ast::visit::Visitor;
 use rustc_span::Span;
 use rustc_span::symbol::{self, Symbol, sym};
+use sha2::{Digest, Sha256};
 use thin_vec::ThinVec;
 use thiserror::Error;
 
@@ -54,6 +55,67 @@ impl<'a> Module<'a> {
     pub(crate) fn attrs(&self) -> &[ast::Attribute] {
         &self.inner_attr
     }
+}
+
+/// Fingerprints nested declarations and their exact cfg/path attributes.
+///
+/// Inline modules and conditional-module macros remain unsupported because their
+/// complete ownership cannot be reconstructed without rerunning the resolver.
+pub(crate) fn module_topology(module: &Module<'_>) -> Option<String> {
+    struct TopologyVisitor {
+        digest: Sha256,
+        declarations: u64,
+        supported: bool,
+    }
+
+    impl<'ast> Visitor<'ast> for TopologyVisitor {
+        fn visit_item(&mut self, item: &'ast ast::Item) {
+            if is_cfg_if(item) || is_cfg_select(item) {
+                self.supported = false;
+                return;
+            }
+            if let ast::ItemKind::Mod(_, _, kind) = &item.kind {
+                if !matches!(kind, ast::ModKind::Unloaded) {
+                    self.supported = false;
+                    return;
+                }
+                let declaration = rustc_ast_pretty::pprust::item_to_string(item);
+                let Ok(length) = u64::try_from(declaration.len()) else {
+                    self.supported = false;
+                    return;
+                };
+                self.declarations = self.declarations.saturating_add(1);
+                self.digest.update(length.to_le_bytes());
+                self.digest.update(declaration.as_bytes());
+                return;
+            }
+
+            rustc_ast::visit::walk_item(self, item);
+        }
+    }
+
+    let mut visitor = TopologyVisitor {
+        digest: Sha256::new(),
+        declarations: 0,
+        supported: true,
+    };
+    visitor.digest.update(b"ohm.rustfmt.module-topology.v1\0");
+    for item in module.items.iter() {
+        visitor.visit_item(item);
+        if !visitor.supported {
+            return None;
+        }
+    }
+    visitor.digest.update(visitor.declarations.to_le_bytes());
+    Some(format!("{:x}", visitor.digest.finalize()))
+}
+
+/// Matches the canonical topology digest for a module with no nested declarations.
+pub(crate) fn empty_module_topology() -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"ohm.rustfmt.module-topology.v1\0");
+    digest.update(0_u64.to_le_bytes());
+    format!("{:x}", digest.finalize())
 }
 
 /// Maps each module to the corresponding file.
