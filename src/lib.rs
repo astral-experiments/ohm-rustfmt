@@ -448,6 +448,7 @@ pub struct Session<'b, T: Write> {
     emitter: Box<dyn Emitter + 'b>,
     module_graph: Option<ResolvedModuleGraph>,
     unchanged_leaf: Option<(PathBuf, PathBuf, String)>,
+    emitted_diagnostics: bool,
 }
 
 /// Files actually selected by rustfmt's native module resolver for each input.
@@ -523,6 +524,7 @@ impl<'b, T: Write + 'b> Session<'b, T> {
             source_file: SourceFile::new(),
             module_graph: None,
             unchanged_leaf: None,
+            emitted_diagnostics: false,
         }
     }
 
@@ -554,6 +556,12 @@ impl<'b, T: Write + 'b> Session<'b, T> {
         self.unchanged_leaf = None;
         let original = fs::read(module).ok();
         let report = self.format_leaf_input(root, module, Some(expected_topology))?;
+        if report
+            .as_ref()
+            .is_some_and(|(_, _, emitted_diagnostics)| *emitted_diagnostics)
+        {
+            self.record_visible_diagnostics();
+        }
         if report
             .as_ref()
             .is_some_and(|(_, _, emitted_diagnostics)| !emitted_diagnostics)
@@ -684,6 +692,11 @@ impl<'b, T: Write + 'b> Session<'b, T> {
     /// Atomically publishes only a complete graph containing exactly the requested roots.
     #[doc(hidden)]
     pub fn write_module_manifest(&self, path: &Path, expected_roots: &[PathBuf]) -> io::Result<()> {
+        if self.emitted_diagnostics || !self.has_no_visible_errors() {
+            return Err(io::Error::other(
+                "the incremental formatter invocation was not clean",
+            ));
+        }
         let Some(graph) = self.module_graph.as_ref().filter(|graph| graph.complete) else {
             return Err(io::Error::other("the rustfmt module graph is incomplete"));
         };
@@ -803,6 +816,12 @@ impl<'b, T: Write + 'b> Session<'b, T> {
             || self.has_check_errors()
             || self.has_diff()
             || self.has_unformatted_code_errors())
+    }
+
+    /// Records diagnostics that were forwarded to rustfmt's observable output.
+    #[doc(hidden)]
+    pub fn record_visible_diagnostics(&mut self) {
+        self.emitted_diagnostics = true;
     }
 
     pub fn has_no_errors(&self) -> bool {
@@ -1527,6 +1546,30 @@ mod unit_tests {
         let manifest_path = directory.path().join("modules.json");
         session.write_module_manifest(&manifest_path, &[root])?;
         assert!(manifest_path.is_file());
+        Ok(())
+    }
+
+    #[test]
+    fn visible_diagnostics_never_publish_an_authoritative_module_manifest() -> io::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let root = directory.path().join("root.rs");
+        fs::write(&root, "fn formatted() {}\n")?;
+
+        let mut output = Vec::new();
+        let mut session = Session::new(Config::default(), Some(&mut output));
+        session.enable_module_graph();
+        session
+            .format(Input::File(root.clone()))
+            .map_err(io::Error::other)?;
+        session.record_visible_diagnostics();
+
+        let manifest_path = directory.path().join("modules.json");
+        let error = session
+            .write_module_manifest(&manifest_path, &[root])
+            .expect_err("visible diagnostics must prevent authoritative publication");
+
+        assert!(error.to_string().contains("was not clean"));
+        assert!(!manifest_path.exists());
         Ok(())
     }
 
