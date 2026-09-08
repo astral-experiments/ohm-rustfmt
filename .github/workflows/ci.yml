@@ -24,7 +24,7 @@ jobs:
     env:
       RUSTUP_TOOLCHAIN: nightly-2026-09-21
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Install pinned Rust toolchain
         run: |
           rustup toolchain install "$RUSTUP_TOOLCHAIN" \
@@ -51,7 +51,7 @@ jobs:
     env:
       CFG_RELEASE_CHANNEL: ${{ matrix.release-channel }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Install pinned Rust toolchain
         run: |
           rustup toolchain install "$RUSTUP_TOOLCHAIN" \
@@ -70,7 +70,7 @@ jobs:
         --document-private-items --enable-index-page --show-type-layout
         --generate-link-to-definition -Zunstable-options -Dwarnings
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Install pinned Rust toolchain
         run: |
           rustup toolchain install "$RUSTUP_TOOLCHAIN" \
