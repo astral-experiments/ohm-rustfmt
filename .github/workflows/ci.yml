@@ -60,7 +60,9 @@ jobs:
             --component llvm-tools \
             --component rustfmt
       - name: Build and test rustfmt, config_proc_macro, and check_diff
-        run: ./ci/build_and_test.sh
+        env:
+          RUSTFLAGS: -D warnings
+        run: cargo run --locked --manifest-path ci/Cargo.toml build-and-test
 
   rustdoc:
     name: Rustdoc
