@@ -26,6 +26,7 @@ const BUG_REPORT_URL: &str = "https://github.com/rust-lang/rustfmt/issues/new?la
 const MODULE_MANIFEST_ENVIRONMENT: &str = "OHM_RUSTFMT_MODULE_MANIFEST";
 const CHANGED_MODULE_ENVIRONMENT: &str = "OHM_RUSTFMT_CHANGED_MODULE";
 const MODULE_TOPOLOGY_ENVIRONMENT: &str = "OHM_RUSTFMT_MODULE_TOPOLOGY";
+const MODULE_WRITE_ENVIRONMENT: &str = "OHM_RUSTFMT_ALLOW_MODULE_WRITE";
 
 // N.B. these crates are loaded from the sysroot, so they need extern crate.
 extern crate rustc_driver;
@@ -362,6 +363,7 @@ fn format(
             }
             Some(paths.into_iter().zip(topologies).collect::<Vec<_>>())
         });
+    let allow_module_write = env::var(MODULE_WRITE_ENVIRONMENT).is_ok_and(|value| value == "1");
     let mut certified_leaves = None;
     if module_manifest.is_some() {
         session.enable_module_graph();
@@ -390,10 +392,20 @@ fn format(
                 }
 
                 certified_leaves = session.override_config(local_config, |session| {
-                    format_targets(session, file, changed_modules.as_deref())
+                    format_targets(
+                        session,
+                        file,
+                        changed_modules.as_deref(),
+                        allow_module_write,
+                    )
                 });
             } else {
-                certified_leaves = format_targets(&mut session, file, changed_modules.as_deref());
+                certified_leaves = format_targets(
+                    &mut session,
+                    file,
+                    changed_modules.as_deref(),
+                    allow_module_write,
+                );
             }
         }
     }
@@ -439,18 +451,24 @@ fn format_targets<T: Write>(
     session: &mut Session<'_, T>,
     root: PathBuf,
     modules: Option<&[(PathBuf, String)]>,
+    allow_module_write: bool,
 ) -> Option<Vec<(PathBuf, PathBuf, String)>> {
     let Some(modules) = modules else {
-        format_target(session, root, None);
+        format_target(session, root, None, false);
         return None;
     };
 
+    // A complete root parse fails before any file is written. Keep that behavior
+    // for batches until all selected modules can be rendered before emission.
+    let allow_module_write =
+        allow_module_write && modules.len() == 1 && session.config.emit_mode() == EmitMode::Files;
     let mut certified = Vec::with_capacity(modules.len());
     for (module, topology) in modules {
         certified.push(format_target(
             session,
             root.clone(),
             Some((module, topology)),
+            allow_module_write,
         )?);
     }
     Some(certified)
@@ -461,6 +479,7 @@ fn format_target<T: Write>(
     session: &mut Session<'_, T>,
     root: PathBuf,
     changed_module: Option<(&Path, &str)>,
+    allow_module_write: bool,
 ) -> Option<(PathBuf, PathBuf, String)> {
     let Some((leaf, topology)) = changed_module else {
         format_and_emit_report(session, Input::File(root));
@@ -468,13 +487,19 @@ fn format_target<T: Write>(
     };
     let original = fs::read(leaf).ok();
 
-    match session.format_module(&root, leaf, topology) {
+    let result = if allow_module_write {
+        session.format_module_with_write(&root, leaf, topology)
+    } else {
+        session.format_module(&root, leaf, topology)
+    };
+    match result {
         Ok(Some(report)) => {
             let has_warnings = report.has_warnings();
             let unchanged = original.is_some_and(|original| {
                 fs::read(leaf).is_ok_and(|formatted| formatted == original)
             });
-            if !has_warnings && session.has_no_visible_errors() && unchanged {
+            if !has_warnings && session.has_no_visible_errors() && (unchanged || allow_module_write)
+            {
                 return Some((root, leaf.to_owned(), String::from(topology)));
             }
             if !session.has_operational_errors()

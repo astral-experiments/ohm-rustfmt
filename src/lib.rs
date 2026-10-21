@@ -39,7 +39,9 @@ use thiserror::Error;
 
 use crate::comment::LineClasses;
 use crate::emitter::Emitter;
-use crate::formatting::{FormatErrorMap, FormattingError, ReportedErrors, SourceFile};
+use crate::formatting::{
+    DirectModuleMode, FormatErrorMap, FormattingError, ReportedErrors, SourceFile,
+};
 use crate::modules::ModuleResolutionError;
 use crate::parse::parser::DirectoryOwnership;
 use crate::parse::session::{FileProbe, ParseSess};
@@ -449,6 +451,7 @@ pub struct Session<'b, T: Write> {
     emitter: Box<dyn Emitter + 'b>,
     module_graph: Option<ResolvedModuleGraph>,
     unchanged_leaves: BTreeSet<(PathBuf, PathBuf, String)>,
+    rewritten_leaves: BTreeSet<(PathBuf, PathBuf, String)>,
     rewritten_sources: bool,
     emitted_diagnostics: bool,
 }
@@ -486,7 +489,7 @@ struct ModuleGraphRoot<'a> {
     probes: Vec<&'a FileProbe>,
 }
 
-/// Authorizes a no-rewrite leaf run without pretending to rediscover its siblings.
+/// Records an unchanged leaf proof or a leaf write that still requires verification.
 #[derive(serde::Serialize)]
 struct LeafFormatCertificate<'a> {
     schema: &'static str,
@@ -532,6 +535,7 @@ impl<'b, T: Write + 'b> Session<'b, T> {
             source_file: SourceFile::new(),
             module_graph: None,
             unchanged_leaves: BTreeSet::new(),
+            rewritten_leaves: BTreeSet::new(),
             rewritten_sources: false,
             emitted_diagnostics: false,
         }
@@ -541,6 +545,7 @@ impl<'b, T: Write + 'b> Session<'b, T> {
     /// given config. `out` is only necessary if required by the configuration.
     pub fn format(&mut self, input: Input) -> Result<FormatReport, ErrorKind> {
         self.unchanged_leaves.clear();
+        self.rewritten_leaves.clear();
         self.format_input_inner(input, false)
     }
 
@@ -562,17 +567,47 @@ impl<'b, T: Write + 'b> Session<'b, T> {
         module: &Path,
         expected_topology: &str,
     ) -> Result<Option<FormatReport>, ErrorKind> {
-        match root.canonicalize().ok().zip(module.canonicalize().ok()) {
-            Some((root, module)) => {
-                self.unchanged_leaves
-                    .retain(|(previous_root, previous_module, _)| {
-                        previous_root != &root || previous_module != &module
-                    })
+        self.format_module_inner(root, module, expected_topology, DirectModuleMode::Unchanged)
+    }
+
+    /// Rewrites a single leaf whose unchanged siblings were validated by cargo-fmt.
+    ///
+    /// A rewritten leaf receives only a pending certificate. The caller must verify
+    /// it read-only and recheck the complete input snapshot before caching the run.
+    #[doc(hidden)]
+    pub fn format_module_with_write(
+        &mut self,
+        root: &Path,
+        module: &Path,
+        expected_topology: &str,
+    ) -> Result<Option<FormatReport>, ErrorKind> {
+        let mode = if self.config.emit_mode() == EmitMode::Files {
+            DirectModuleMode::Rewrite
+        } else {
+            DirectModuleMode::Unchanged
+        };
+        self.format_module_inner(root, module, expected_topology, mode)
+    }
+
+    /// Invalidates prior leaf proofs before collecting this invocation's result.
+    fn format_module_inner(
+        &mut self,
+        root: &Path,
+        module: &Path,
+        expected_topology: &str,
+        mode: DirectModuleMode,
+    ) -> Result<Option<FormatReport>, ErrorKind> {
+        let canonical = root.canonicalize().ok().zip(module.canonicalize().ok());
+        for proofs in [&mut self.unchanged_leaves, &mut self.rewritten_leaves] {
+            match canonical.as_ref() {
+                Some((root, module)) => proofs.retain(|(previous_root, previous_module, _)| {
+                    previous_root != root || previous_module != module
+                }),
+                None => proofs.clear(),
             }
-            None => self.unchanged_leaves.clear(),
         }
         let original = fs::read(module).ok();
-        let report = self.format_leaf_input(root, module, Some(expected_topology))?;
+        let report = self.format_leaf_input(root, module, Some(expected_topology), mode)?;
         if report
             .as_ref()
             .is_some_and(|(_, _, emitted_diagnostics)| *emitted_diagnostics)
@@ -583,17 +618,22 @@ impl<'b, T: Write + 'b> Session<'b, T> {
             .as_ref()
             .is_some_and(|(_, _, emitted_diagnostics)| !emitted_diagnostics)
             && self.has_no_visible_errors()
-            && original
-                .is_some_and(|original| fs::read(module).is_ok_and(|result| result == original))
         {
-            if let Some(unchanged) = root
+            if let Some((proof, unchanged)) = root
                 .canonicalize()
                 .ok()
                 .zip(module.canonicalize().ok())
                 .zip(report.as_ref().map(|(_, topology, _)| topology.clone()))
-                .map(|((root, module), topology)| (root, module, topology))
+                .zip(original.zip(fs::read(module).ok()))
+                .map(|(((root, module), topology), (original, result))| {
+                    ((root, module, topology), original == result)
+                })
             {
-                self.unchanged_leaves.insert(unchanged);
+                if unchanged {
+                    self.unchanged_leaves.insert(proof);
+                } else if mode == DirectModuleMode::Rewrite {
+                    self.rewritten_leaves.insert(proof);
+                }
             }
         }
         Ok(report.map(|(report, _, _)| report))
@@ -754,7 +794,7 @@ impl<'b, T: Write + 'b> Session<'b, T> {
         write_authoritative_manifest(path, &manifest)
     }
 
-    /// Publishes proof that a context-preserving leaf was already correctly formatted.
+    /// Publishes an unchanged proof or a pending certificate for one isolated leaf write.
     #[doc(hidden)]
     pub fn write_leaf_certificate(
         &self,
@@ -766,7 +806,7 @@ impl<'b, T: Write + 'b> Session<'b, T> {
         self.write_leaf_certificates(path, root, &[(leaf.to_owned(), String::from(topology))])
     }
 
-    /// Publishes proof only for previously certified, distinct leaves of the exact root.
+    /// Publishes unchanged proofs for distinct leaves or a pending proof for one written leaf.
     #[doc(hidden)]
     pub fn write_leaf_certificates(
         &self,
@@ -782,18 +822,18 @@ impl<'b, T: Write + 'b> Session<'b, T> {
         let root = root.canonicalize()?;
         let mut canonical = Vec::with_capacity(leaves.len());
         let mut unique = BTreeSet::new();
+        let mut rewritten = false;
         for (leaf, topology) in leaves {
             let leaf = leaf.canonicalize()?;
-            if root == leaf
-                || !unique.insert(leaf.clone())
-                || !self
-                    .unchanged_leaves
-                    .contains(&(root.clone(), leaf.clone(), topology.clone()))
-            {
+            let proof = (root.clone(), leaf.clone(), topology.clone());
+            let unchanged = self.unchanged_leaves.contains(&proof);
+            let authorized_write = leaves.len() == 1 && self.rewritten_leaves.contains(&proof);
+            if root == leaf || !unique.insert(leaf.clone()) || !(unchanged || authorized_write) {
                 return Err(io::Error::other(
-                    "the incremental leaf was not proven unchanged",
+                    "the incremental leaf was not proven unchanged or rewritten in isolation",
                 ));
             }
+            rewritten |= authorized_write;
             canonical.push((leaf, topology));
         }
         if canonical.is_empty() {
@@ -803,7 +843,7 @@ impl<'b, T: Write + 'b> Session<'b, T> {
             path,
             &LeafFormatCertificate {
                 schema: "ohm.rustfmt-leaf",
-                version: 3,
+                version: if rewritten { 4 } else { 3 },
                 root: &root,
                 leaves: canonical
                     .iter()

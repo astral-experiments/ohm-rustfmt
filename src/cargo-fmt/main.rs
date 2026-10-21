@@ -183,6 +183,7 @@ fn rustfmt_command() -> Command {
         "OHM_RUSTFMT_MODULE_MANIFEST",
         "OHM_RUSTFMT_CHANGED_MODULE",
         "OHM_RUSTFMT_MODULE_TOPOLOGY",
+        "OHM_RUSTFMT_ALLOW_MODULE_WRITE",
     ] {
         command.env_remove(variable);
     }
@@ -632,6 +633,9 @@ fn run_rustfmt_with_output(
                 .join(",");
             command.env("OHM_RUSTFMT_CHANGED_MODULE", paths);
             command.env("OHM_RUSTFMT_MODULE_TOPOLOGY", topologies);
+            if modules.len() == 1 && !fmt_args.iter().any(|argument| argument == "--check") {
+                command.env("OHM_RUSTFMT_ALLOW_MODULE_WRITE", "1");
+            }
         }
         if output_mode != RustfmtOutputMode::Inherit {
             command.stderr(std::process::Stdio::piped());

@@ -29,6 +29,13 @@ mod newline_style;
 pub(crate) type SourceFile = Vec<FileRecord>;
 pub(crate) type FileRecord = (FileName, String);
 
+/// Distinguishes speculative no-op formatting from a driver-authorized leaf write.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DirectModuleMode {
+    Unchanged,
+    Rewrite,
+}
+
 impl<'b, T: Write + 'b> Session<'b, T> {
     pub(crate) fn format_input_inner(
         &mut self,
@@ -64,6 +71,7 @@ impl<'b, T: Write + 'b> Session<'b, T> {
         root: &Path,
         leaf: &Path,
         expected_topology: Option<&str>,
+        mode: DirectModuleMode,
     ) -> Result<Option<(FormatReport, String, bool)>, ErrorKind> {
         if !self.config.version_meets_requirement() {
             return Err(ErrorKind::VersionMismatch);
@@ -74,7 +82,8 @@ impl<'b, T: Write + 'b> Session<'b, T> {
 
         rustc_span::create_session_if_not_set_then(self.config.edition().into(), |_| {
             let configuration = self.config.clone();
-            let report = format_leaf_project(root, leaf, expected_topology, &configuration, self)?;
+            let report =
+                format_leaf_project(root, leaf, expected_topology, mode, &configuration, self)?;
             if let Some((report, _, _)) = report.as_ref() {
                 self.errors.add(&report.internal.borrow().1);
             }
@@ -88,6 +97,7 @@ fn format_leaf_project<T: FormatHandler>(
     root: &Path,
     leaf: &Path,
     expected_topology: Option<&str>,
+    mode: DirectModuleMode,
     config: &Config,
     handler: &mut T,
 ) -> Result<Option<(FormatReport, String, bool)>, ErrorKind> {
@@ -133,7 +143,7 @@ fn format_leaf_project<T: FormatHandler>(
     }
 
     context.psess.set_silent_emitter();
-    if !context.format_file(leaf_file, &module, false, true)? {
+    if !context.format_file(leaf_file, &module, false, Some(mode))? {
         return Ok(None);
     }
     let emitted_diagnostics = context.psess.emitted_diagnostics();
@@ -357,7 +367,7 @@ fn format_project<T: FormatHandler>(
             return echo_back_stdin(context.psess.snippet_provider(module.span).entire_snippet());
         }
         should_emit_verbose(input_is_stdin, config, || println!("Formatting {}", path));
-        context.format_file(path, &module, is_macro_def, false)?;
+        context.format_file(path, &module, is_macro_def, None)?;
     }
     timer = timer.done_formatting();
 
@@ -411,7 +421,7 @@ impl<'a, T: FormatHandler + 'a> FormatContext<'a, T> {
         path: FileName,
         module: &Module<'_>,
         is_macro_def: bool,
-        require_unchanged: bool,
+        direct_mode: Option<DirectModuleMode>,
     ) -> Result<bool, ErrorKind> {
         let snippet_provider = self.psess.snippet_provider(module.span);
         let mut visitor = FmtVisitor::from_psess(
@@ -458,7 +468,7 @@ impl<'a, T: FormatHandler + 'a> FormatContext<'a, T> {
             snippet_provider.entire_snippet(),
         );
 
-        if require_unchanged {
+        if let Some(mode) = direct_mode {
             let errors = &self.report.internal.borrow().1;
             let has_visible_errors = errors.has_operational_errors
                 || errors.has_parsing_errors
@@ -479,7 +489,10 @@ impl<'a, T: FormatHandler + 'a> FormatContext<'a, T> {
                 }
                 FileName::Stdin => false,
             });
-            if has_visible_errors || self.psess.emitted_diagnostics() || !unchanged {
+            if has_visible_errors
+                || self.psess.emitted_diagnostics()
+                || (mode == DirectModuleMode::Unchanged && !unchanged)
+            {
                 return Ok(false);
             }
         }

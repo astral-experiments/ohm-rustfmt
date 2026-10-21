@@ -252,6 +252,150 @@ fn incremental_rewritten_module_also_formats_its_root_and_siblings() -> std::io:
 }
 
 #[test]
+fn authorized_leaf_write_requires_a_separate_unchanged_certificate() -> std::io::Result<()> {
+    let directory = tempfile::tempdir()?;
+    let directory = directory.path().canonicalize()?;
+    let root = directory.join("lib.rs");
+    let leaf = directory.join("child.rs");
+    let sibling = directory.join("sibling.rs");
+    fs::write(&root, "mod child;\nmod sibling;\n")?;
+    fs::write(&sibling, "fn sibling() {}\n")?;
+    let original = "fn child( ){ }\n";
+    fs::write(&leaf, original)?;
+    let native = Command::new(env!("CARGO_BIN_EXE_rustfmt"))
+        .arg(&root)
+        .output()?;
+    let expected = fs::read(&leaf)?;
+    fs::write(&leaf, original)?;
+
+    let incremental = rustfmt_incremental_leaf_command(&root, &leaf)
+        .env("OHM_RUSTFMT_ALLOW_MODULE_WRITE", "1")
+        .output()?;
+    assert_eq!(incremental.status.code(), native.status.code());
+    assert_eq!(incremental.stdout, native.stdout);
+    assert_eq!(incremental.stderr, native.stderr);
+    assert_eq!(fs::read(&leaf)?, expected);
+    let certificate = root.with_extension("modules.json");
+    let written: serde_json::Value = serde_json::from_slice(&fs::read(&certificate)?)?;
+    assert_eq!(written["schema"], "ohm.rustfmt-leaf");
+    assert_eq!(written["version"], 4);
+
+    fs::remove_file(&certificate)?;
+    let verified = rustfmt_with_incremental_leaf(&root, &leaf)?;
+    assert!(verified.status.success());
+    let unchanged: serde_json::Value = serde_json::from_slice(&fs::read(&certificate)?)?;
+    assert_eq!(unchanged["schema"], "ohm.rustfmt-leaf");
+    assert_eq!(unchanged["version"], 3);
+    assert_eq!(fs::read(&leaf)?, expected);
+    Ok(())
+}
+
+#[test]
+fn leaf_write_authority_preserves_other_emit_modes() -> std::io::Result<()> {
+    let directory = tempfile::tempdir()?;
+    let directory = directory.path().canonicalize()?;
+    let root = directory.join("lib.rs");
+    let leaf = directory.join("child.rs");
+    let sibling = directory.join("sibling.rs");
+    fs::write(&root, "mod child;\nmod sibling;\n\nfn root( ){ }\n")?;
+    fs::write(&leaf, "fn child( ){ }\n")?;
+    fs::write(&sibling, "fn sibling( ){ }\n")?;
+
+    for arguments in [vec!["--check"], vec!["--emit", "stdout"]] {
+        let native = Command::new(env!("CARGO_BIN_EXE_rustfmt"))
+            .arg(&root)
+            .args(&arguments)
+            .output()?;
+        let incremental = rustfmt_incremental_leaf_command(&root, &leaf)
+            .env("OHM_RUSTFMT_ALLOW_MODULE_WRITE", "1")
+            .args(&arguments)
+            .output()?;
+        assert_eq!(incremental.status.code(), native.status.code());
+        assert_eq!(incremental.stdout, native.stdout);
+        assert_eq!(incremental.stderr, native.stderr);
+        assert_eq!(fs::read_to_string(&leaf)?, "fn child( ){ }\n");
+    }
+    Ok(())
+}
+
+#[test]
+fn leaf_write_authority_does_not_partially_write_a_rejected_batch() -> std::io::Result<()> {
+    let directory = tempfile::tempdir()?;
+    let directory = directory.path().canonicalize()?;
+    let root = directory.join("lib.rs");
+    let first = directory.join("first.rs");
+    let second = directory.join("second.rs");
+    fs::write(&root, "mod first;\nmod second;\n")?;
+    fs::write(&first, "fn first( ){ }\n")?;
+    fs::write(&second, "fn second( {\n")?;
+    let native = Command::new(env!("CARGO_BIN_EXE_rustfmt"))
+        .arg(&root)
+        .output()?;
+    let mut topology = Sha256::new();
+    topology.update(b"ohm.rustfmt.module-topology.v1\0");
+    topology.update(0_u64.to_le_bytes());
+    let topology = format!("{:x}", topology.finalize());
+    let paths = env::join_paths([&first, &second]).map_err(std::io::Error::other)?;
+    let incremental = rustfmt_incremental_leaf_command(&root, &first)
+        .env("OHM_RUSTFMT_CHANGED_MODULE", paths)
+        .env(
+            "OHM_RUSTFMT_MODULE_TOPOLOGY",
+            format!("{topology},{topology}"),
+        )
+        .env("OHM_RUSTFMT_ALLOW_MODULE_WRITE", "1")
+        .output()?;
+    assert!(!native.status.success());
+    assert_eq!(incremental.status.code(), native.status.code());
+    assert_eq!(incremental.stdout, native.stdout);
+    assert_eq!(incremental.stderr, native.stderr);
+    assert_eq!(fs::read_to_string(&first)?, "fn first( ){ }\n");
+    assert!(!root.with_extension("modules.json").exists());
+    Ok(())
+}
+
+#[test]
+fn leaf_write_authority_rejects_changed_topology_and_parser_diagnostics() -> std::io::Result<()> {
+    let directory = tempfile::tempdir()?;
+    let directory = directory.path().canonicalize()?;
+    let root = directory.join("lib.rs");
+    let leaf = directory.join("child.rs");
+    let nested = directory.join("nested.rs");
+    fs::write(&root, "mod child;\n")?;
+    for original in [
+        "#[path = \"nested.rs\"]\nmod nested;\nfn child( ){ }\n",
+        "fn child() {\n    let _ = \"\\\n\n             \";\n}\n",
+        "fn child( {\n",
+    ] {
+        fs::write(&leaf, original)?;
+        fs::write(&nested, "fn nested( ){ }\n")?;
+        let native = Command::new(env!("CARGO_BIN_EXE_rustfmt"))
+            .arg(&root)
+            .output()?;
+        let expected_leaf = fs::read(&leaf)?;
+        let expected_nested = fs::read(&nested)?;
+        fs::write(&leaf, original)?;
+        fs::write(&nested, "fn nested( ){ }\n")?;
+        let certificate = root.with_extension("modules.json");
+        if certificate.exists() {
+            fs::remove_file(&certificate)?;
+        }
+        let incremental = rustfmt_incremental_leaf_command(&root, &leaf)
+            .env("OHM_RUSTFMT_ALLOW_MODULE_WRITE", "1")
+            .output()?;
+        assert_eq!(incremental.status.code(), native.status.code());
+        assert_eq!(incremental.stdout, native.stdout);
+        assert_eq!(incremental.stderr, native.stderr);
+        assert_eq!(fs::read(&leaf)?, expected_leaf);
+        assert_eq!(fs::read(&nested)?, expected_nested);
+        if certificate.exists() {
+            let manifest: serde_json::Value = serde_json::from_slice(&fs::read(certificate)?)?;
+            assert_ne!(manifest["schema"], "ohm.rustfmt-leaf");
+        }
+    }
+    Ok(())
+}
+
+#[test]
 fn incremental_malformed_sibling_never_rewrites_a_changed_module() -> std::io::Result<()> {
     let directory = tempfile::tempdir()?;
     let directory = directory.path().canonicalize()?;
