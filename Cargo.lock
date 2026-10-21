@@ -597,6 +597,7 @@ dependencies = [
  "itertools",
  "regex",
  "rustfmt-config_proc_macro",
+ "rustix",
  "semver",
  "serde",
  "serde_json",

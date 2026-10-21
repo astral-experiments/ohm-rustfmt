@@ -192,8 +192,8 @@ fn direct_root_module_topology(
         }
         filename.strip_suffix(".rs")?
     };
-    let canonical_directory = directory.canonicalize().ok()?;
-    let canonical_leaf = leaf.canonicalize().ok()?;
+    let canonical_directory = crate::path_utils::canonicalize(directory).ok()?;
+    let canonical_leaf = crate::path_utils::canonicalize(leaf).ok()?;
 
     let direct = krate.items.iter().any(|item| {
         if !item.attrs.is_empty() {
@@ -226,8 +226,7 @@ fn direct_root_module_topology(
         let matches = candidates
             .iter()
             .filter_map(|(candidate, logical)| {
-                candidate
-                    .canonicalize()
+                crate::path_utils::canonicalize(candidate)
                     .ok()
                     .map(|canonical| (logical, canonical))
             })

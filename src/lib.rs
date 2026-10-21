@@ -87,6 +87,7 @@ pub(crate) mod modules;
 mod overflow;
 mod pairs;
 mod parse;
+mod path_utils;
 mod patterns;
 mod range;
 mod release_channel;
@@ -502,7 +503,7 @@ struct CertifiedModule<'a> {
 
 /// Rejects unresolved and non-UTF-8 paths that cannot be represented in a cache manifest.
 fn canonical_graph_path(path: &Path) -> Option<PathBuf> {
-    let canonical = path.canonicalize().ok()?;
+    let canonical = path_utils::canonicalize(path).ok()?;
     canonical.to_str().is_some().then_some(canonical)
 }
 

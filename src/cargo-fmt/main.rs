@@ -18,6 +18,9 @@ use clap::{CommandFactory, Parser};
 
 mod incremental;
 
+#[path = "../path_utils.rs"]
+mod path_utils;
+
 #[path = "test/mod.rs"]
 #[cfg(test)]
 mod cargo_fmt_tests;
