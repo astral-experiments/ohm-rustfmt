@@ -1191,7 +1191,7 @@ pub(crate) fn find_comment_end(s: &str) -> Option<usize> {
 
 /// Returns `true` if text contains any comment.
 pub(crate) fn contains_comment(text: &str) -> bool {
-    CharClasses::new(text.chars()).any(|(kind, _)| kind.is_comment())
+    text.contains('/') && CharClasses::new(text.chars()).any(|(kind, _)| kind.is_comment())
 }
 
 pub(crate) struct CharClasses<T>
@@ -1763,6 +1763,11 @@ pub(crate) fn filter_normal_code(code: &str) -> String {
 /// - whitespace,
 /// - '*' at the beginning of lines in block comments.
 fn changed_comment_content(orig: &str, new: &str) -> bool {
+    // A slash is required to open a comment. Avoid lexing code that has none.
+    if !orig.contains('/') && !new.contains('/') {
+        return false;
+    }
+
     // Cannot write this as a fn since we cannot return types containing closures.
     let code_comment_content = |code| {
         let slices = UngroupedCommentCodeSlices::new(code);
@@ -2016,9 +2021,25 @@ mod test {
     #[test]
     fn test_contains_comment() {
         assert_eq!(contains_comment("abc"), false);
+        assert_eq!(contains_comment("let ratio = 8 / 2;"), false);
         assert_eq!(contains_comment("abc // qsdf"), true);
         assert_eq!(contains_comment("abc /* kqsdf"), true);
         assert_eq!(contains_comment("abc \" /* */\" qsdf"), false);
+    }
+
+    #[test]
+    fn test_changed_comment_content() {
+        for (orig, new, changed) in [
+            ("let π=1;", "let π = 1;", false),
+            ("let ratio = 8 / 2;", "let ratio = 4;", false),
+            (r#"let s = "/* a */";"#, r#"let s = "// b";"#, false),
+            ("let n = 1; // note", "let n = 1;", true),
+            ("/* note */ let n = 1;", "let n = 1; /* note */", false),
+            ("/* note */", "/* other */", true),
+        ] {
+            assert_eq!(changed_comment_content(orig, new), changed, "{orig:?}");
+            assert_eq!(changed_comment_content(new, orig), changed, "{new:?}");
+        }
     }
 
     #[test]
