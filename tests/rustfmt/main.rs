@@ -224,6 +224,56 @@ fn incremental_malformed_module_preserves_native_resolution_diagnostics() -> std
 }
 
 #[test]
+fn incremental_root_diagnostics_match_native_before_any_leaf_write() -> std::io::Result<()> {
+    let directory = tempfile::tempdir()?;
+    let directory = directory.path().canonicalize()?;
+    let root = directory.join("lib.rs");
+    let leaf = directory.join("child.rs");
+    let certificate = root.with_extension("modules.json");
+    let original_leaf = "fn child( ){ }\n";
+    for original_root in [
+        "mod child;\nfn root() {\n    let _ = \"\\\n\n             \";\n}\n",
+        "mod child;\nfn root( {\n",
+    ] {
+        for check in [false, true] {
+            fs::write(&root, original_root)?;
+            fs::write(&leaf, original_leaf)?;
+            let mut native = Command::new(env!("CARGO_BIN_EXE_rustfmt"));
+            native.arg(&root);
+            let mut incremental = rustfmt_incremental_leaf_command(&root, &leaf);
+            incremental.env("OHM_RUSTFMT_ALLOW_MODULE_WRITE", "1");
+            if check {
+                native.arg("--check");
+                incremental.arg("--check");
+            }
+            let native = native.output()?;
+            assert!(
+                !native.stderr.is_empty(),
+                "expected a root parser diagnostic"
+            );
+            let expected_root = fs::read(&root)?;
+            let expected_leaf = fs::read(&leaf)?;
+            fs::write(&root, original_root)?;
+            fs::write(&leaf, original_leaf)?;
+            if certificate.exists() {
+                fs::remove_file(&certificate)?;
+            }
+            let incremental = incremental.output()?;
+            assert_eq!(incremental.status.code(), native.status.code());
+            assert_eq!(incremental.stdout, native.stdout);
+            assert_eq!(incremental.stderr, native.stderr);
+            assert_eq!(fs::read(&root)?, expected_root);
+            assert_eq!(fs::read(&leaf)?, expected_leaf);
+            if certificate.exists() {
+                let manifest: serde_json::Value = serde_json::from_slice(&fs::read(&certificate)?)?;
+                assert_ne!(manifest["schema"], "ohm.rustfmt-leaf");
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
 fn incremental_rewritten_module_also_formats_its_root_and_siblings() -> std::io::Result<()> {
     let directory = tempfile::tempdir()?;
     let directory = directory.path().canonicalize()?;
