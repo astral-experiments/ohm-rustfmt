@@ -447,6 +447,80 @@ fn cargo_fmt_caches_clean_checks_without_a_second_formatter_pass() -> std::io::R
 
 #[cfg(unix)]
 #[test]
+fn cargo_fmt_verifies_only_rewritten_direct_leaves() -> std::io::Result<()> {
+    let directory = tempfile::tempdir()?;
+    for (name, verify_leaves) in [("ordinary", true), ("with:separator", false)] {
+        let package = directory.path().canonicalize()?.join(name);
+        fs::create_dir(&package)?;
+        let (tools, compiler_libraries) = trusted_formatter_tools(&package)?;
+        let sources = package.join("src");
+        fs::create_dir(&sources)?;
+        let manifest = package.join("Cargo.toml");
+        fs::write(
+            &manifest,
+            "[package]\nname = \"rewritten-leaf-check\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )?;
+        fs::write(sources.join("lib.rs"), "mod child;\nmod sibling;\n")?;
+        let child = sources.join("child.rs");
+        let sibling = sources.join("sibling.rs");
+        fs::write(&child, "pub fn child() {}\n")?;
+        fs::write(&sibling, "pub fn sibling() {}\n")?;
+
+        let run = |enabled: &str| {
+            Command::new(tools.join("cargo-fmt"))
+                .arg("--manifest-path")
+                .arg(&manifest)
+                .current_dir(&package)
+                .env("OHM_INCREMENTAL_FMT", enabled)
+                .env("OHM_INCREMENTAL_FMT_TRACE", "1")
+                .env("OHM_INCREMENTAL_FMT_CACHE_DIR", package.join("cache"))
+                .env("DYLD_LIBRARY_PATH", &compiler_libraries)
+                .env("LD_LIBRARY_PATH", &compiler_libraries)
+                .env_remove("DYLD_FALLBACK_LIBRARY_PATH")
+                .output()
+        };
+        assert!(run("1")?.status.success());
+
+        fs::write(&child, "pub fn changed( ){ }\n")?;
+        let changed = std::time::UNIX_EPOCH + std::time::Duration::from_secs(2_000_000_000);
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&child)?
+            .set_times(fs::FileTimes::new().set_modified(changed))?;
+        let incremental = run("1")?;
+        assert!(incremental.status.success());
+        let trace = String::from_utf8_lossy(&incremental.stderr);
+        assert_eq!(
+            trace.contains("verifying 1 rewritten direct leaves"),
+            verify_leaves,
+            "{trace}",
+        );
+        assert_eq!(
+            trace.contains("verified rewritten direct leaves with authoritative certificates"),
+            verify_leaves,
+            "{trace}",
+        );
+        let formatted = fs::read_to_string(&child)?;
+        assert_eq!(formatted, "pub fn changed() {}\n");
+        assert_eq!(fs::read_to_string(&sibling)?, "pub fn sibling() {}\n");
+
+        let cached = run("1")?;
+        assert!(cached.status.success());
+        let trace = String::from_utf8_lossy(&cached.stderr);
+        assert!(trace.contains("cache hit: 1 unchanged packages"), "{trace}");
+
+        fs::write(&child, "pub fn changed( ){ }\n")?;
+        let native = run("0")?;
+        assert_eq!(incremental.status.code(), native.status.code());
+        assert_eq!(incremental.stdout, native.stdout);
+        assert_eq!(fs::read_to_string(&child)?, formatted);
+        assert_eq!(fs::read_to_string(&sibling)?, "pub fn sibling() {}\n");
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
 fn cargo_fmt_batches_clean_leaves_without_hiding_multiple_formatting_errors() -> std::io::Result<()>
 {
     let directory = tempfile::tempdir()?;

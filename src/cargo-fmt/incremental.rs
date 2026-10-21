@@ -269,9 +269,7 @@ pub(super) fn format(
         trace("falling back to complete formatting for an invalid cache path");
         return run_rustfmt(targets, arguments, verbosity);
     };
-    let changed_leaves = plan
-        .changed_leaves(&changed_roots)
-        .filter(|leaves| env::join_paths(leaves.iter().map(|leaf| Path::new(&leaf.path))).is_ok());
+    let changed_leaves = plan.changed_leaves(&changed_roots);
     let requested_modules = changed_leaves.as_ref().map(|leaves| {
         leaves
             .iter()
@@ -421,8 +419,26 @@ pub(super) fn format(
                 return Ok(output.status);
             }
 
-            let verification =
-                verify_formatted_targets(&changed_targets, arguments, cache_directory)?;
+            let verification_leaves =
+                Plan::changed_leaves_between(&plan.current, &updated, &changed_roots);
+            let verification_modules = verification_leaves.as_ref().map(|leaves| {
+                leaves
+                    .iter()
+                    .map(|leaf| (PathBuf::from(&leaf.path), leaf.topology.clone()))
+                    .collect::<Vec<_>>()
+            });
+            if let Some(leaves) = verification_leaves.as_ref() {
+                trace(&format!(
+                    "verifying {} rewritten direct leaves",
+                    leaves.len()
+                ));
+            }
+            let verification = verify_formatted_targets(
+                &changed_targets,
+                arguments,
+                cache_directory,
+                verification_modules.as_deref(),
+            )?;
             if verification.emitted_diagnostics {
                 trace("not caching a formatter invocation that emitted diagnostics");
                 return Ok(output.status);
@@ -431,8 +447,16 @@ pub(super) fn format(
                 trace("not caching files changed concurrently with formatting");
                 return Ok(output.status);
             }
-            let verification_discovery =
-                match read_module_manifests(&verification.module_manifests, &changed_targets) {
+            let certified_leaves = verification_leaves.as_ref().is_some_and(|leaves| {
+                read_leaf_certificate(&verification.module_manifests, leaves).is_ok()
+            });
+            if certified_leaves {
+                trace("verified rewritten direct leaves with authoritative certificates");
+            } else {
+                let verification_discovery = match read_module_manifests(
+                    &verification.module_manifests,
+                    &changed_targets,
+                ) {
                     Ok(discovery) => discovery,
                     Err(error) => {
                         trace(&format!(
@@ -441,9 +465,10 @@ pub(super) fn format(
                         return Ok(output.status);
                     }
                 };
-            if !discovery_matches(&verification_discovery, &modules, &leaves, &probes) {
-                trace("not caching a module graph changed concurrently with formatting");
-                return Ok(output.status);
+                if !discovery_matches(&verification_discovery, &modules, &leaves, &probes) {
+                    trace("not caching a module graph changed concurrently with formatting");
+                    return Ok(output.status);
+                }
             }
 
             let verified = match Snapshot::capture(
@@ -538,11 +563,12 @@ fn lock_cache(manifest_path: Option<&Path>) -> io::Result<File> {
     Ok(lock)
 }
 
-/// Silently rechecks formatted targets and obtains a second authoritative module graph.
+/// Silently rechecks formatted targets or leaves with authoritative producer output.
 fn verify_formatted_targets(
     targets: &BTreeSet<Target>,
     arguments: &[String],
     manifest_directory: &Path,
+    changed_modules: Option<&[(PathBuf, String)]>,
 ) -> io::Result<RustfmtOutput> {
     let check_arguments = verification_arguments(arguments);
     run_rustfmt_with_output(
@@ -551,7 +577,7 @@ fn verify_formatted_targets(
         Verbosity::Quiet,
         RustfmtOutputMode::CaptureQuietly,
         Some(manifest_directory),
-        None,
+        changed_modules,
     )
 }
 
@@ -741,18 +767,25 @@ impl Plan {
         }
     }
 
-    /// Selects verified direct leaves with no alternate owners or source-graph changes.
+    /// Selects verified direct leaves changed since the last clean invocation.
     fn changed_leaves(&self, changed_roots: &BTreeSet<&str>) -> Option<Vec<ChangedLeaf>> {
+        Self::changed_leaves_between(self.previous.as_ref()?, &self.current, changed_roots)
+    }
+
+    /// Selects verified direct leaves with no alternate owners or source-graph changes.
+    fn changed_leaves_between(
+        previous: &Snapshot,
+        current: &Snapshot,
+        changed_roots: &BTreeSet<&str>,
+    ) -> Option<Vec<ChangedLeaf>> {
         if changed_roots.len() != 1 {
             return None;
         }
-        let previous = self.previous.as_ref()?;
-        if previous.configuration != self.current.configuration {
+        if previous.configuration != current.configuration {
             return None;
         }
         let root = (*changed_roots.iter().next()?).to_owned();
-        let (package_path, current_package) = self
-            .current
+        let (package_path, current_package) = current
             .packages
             .iter()
             .find(|(_, package)| package.targets.contains_key(&root))?;
@@ -775,8 +808,7 @@ impl Plan {
                     return None;
                 }
                 let topology = previous_package.leaves.get(&root)?.get(path)?.clone();
-                let owners = self
-                    .current
+                let owners = current
                     .packages
                     .values()
                     .flat_map(|package| package.targets.values())
@@ -796,6 +828,7 @@ impl Plan {
         {
             return None;
         }
+        env::join_paths(changes.iter().map(|leaf| Path::new(&leaf.path))).ok()?;
         Some(changes)
     }
 
