@@ -3,6 +3,7 @@
 use std::{borrow::Cow, iter};
 
 use itertools::{Itertools as _, MultiPeek, multipeek};
+use memchr::memchr;
 use rustc_span::Span;
 use tracing::{debug, trace};
 
@@ -1191,7 +1192,8 @@ pub(crate) fn find_comment_end(s: &str) -> Option<usize> {
 
 /// Returns `true` if text contains any comment.
 pub(crate) fn contains_comment(text: &str) -> bool {
-    text.contains('/') && CharClasses::new(text.chars()).any(|(kind, _)| kind.is_comment())
+    memchr(b'/', text.as_bytes()).is_some()
+        && CharClasses::new(text.chars()).any(|(kind, _)| kind.is_comment())
 }
 
 pub(crate) struct CharClasses<T>
@@ -1764,7 +1766,7 @@ pub(crate) fn filter_normal_code(code: &str) -> String {
 /// - '*' at the beginning of lines in block comments.
 fn changed_comment_content(orig: &str, new: &str) -> bool {
     // A slash is required to open a comment. Avoid lexing code that has none.
-    if !orig.contains('/') && !new.contains('/') {
+    if memchr(b'/', orig.as_bytes()).is_none() && memchr(b'/', new.as_bytes()).is_none() {
         return false;
     }
 
