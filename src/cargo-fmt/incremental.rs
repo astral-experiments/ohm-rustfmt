@@ -222,7 +222,7 @@ pub(super) fn format(
         return run_rustfmt(targets, arguments, verbosity);
     }
 
-    let _cache_lock = match lock_cache(manifest_path) {
+    let cache_lock = match lock_cache(manifest_path) {
         Ok(lock) => lock,
         Err(error) => {
             trace(&format!("falling back to complete formatting: {error}"));
@@ -233,6 +233,7 @@ pub(super) fn format(
     let plan = match Plan::prepare(targets, arguments, manifest_path) {
         Ok(plan) => plan,
         Err(error) => {
+            drop(cache_lock);
             trace(&format!("falling back to complete formatting: {error}"));
             return run_rustfmt(targets, arguments, verbosity);
         }
