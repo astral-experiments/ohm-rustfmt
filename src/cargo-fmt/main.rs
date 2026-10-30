@@ -659,7 +659,7 @@ fn run_rustfmt_with_output(
         let edition_status = child.wait()?;
         emitted_diagnostics |= diagnostics? != 0;
         if !edition_status.success() {
-            status = status.or_else(|| edition_status.code());
+            status.get_or_insert_with(|| edition_status.code().unwrap_or(1));
         }
     }
 

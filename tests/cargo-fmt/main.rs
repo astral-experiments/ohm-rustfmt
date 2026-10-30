@@ -138,6 +138,28 @@ fn cargo_fmt_emits_error_on_line_overflow_true() {
     ))
 }
 
+#[cfg(unix)]
+#[test]
+fn cargo_fmt_fails_when_rustfmt_is_terminated() -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let directory = tempfile::tempdir()?;
+    let formatter = directory.path().join("rustfmt");
+    fs::write(&formatter, "#!/bin/sh\nkill -TERM $$\n")?;
+    fs::set_permissions(&formatter, fs::Permissions::from_mode(0o755))?;
+    let status = cargo_fmt_command()
+        .args([
+            "--check",
+            "--manifest-path",
+            "tests/cargo-fmt/source/issue_3164/Cargo.toml",
+        ])
+        .env("RUSTFMT", formatter)
+        .env("OHM_INCREMENTAL_FMT", "0")
+        .status()?;
+    assert!(!status.success());
+    Ok(())
+}
+
 #[test]
 fn cargo_fmt_never_inherits_internal_module_handoffs() -> std::io::Result<()> {
     let directory = tempfile::tempdir()?;
