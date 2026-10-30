@@ -16,7 +16,7 @@ use super::{
     run_rustfmt_with_output, rustfmt_command,
 };
 
-const CACHE_VERSION: u32 = 11;
+const CACHE_VERSION: u32 = 12;
 const MODULE_MANIFEST_VERSION: u32 = 3;
 const MODULE_MANIFEST_SCHEMA: &str = "ohm.rustfmt-files";
 const MODULE_MANIFEST_ENVIRONMENT: &str = "OHM_RUSTFMT_MODULE_MANIFEST";
@@ -300,20 +300,20 @@ pub(super) fn format(
         Some(cache_directory),
         requested_modules.as_deref(),
     )?;
-    if output.status != SUCCESS {
+    if output.status != SUCCESS || output.emitted_diagnostics {
         if batch {
-            trace("reformatting the complete target after an unsuccessful leaf batch");
+            trace(
+                "reformatting the complete target after a leaf batch failed or emitted diagnostics",
+            );
             return run_rustfmt(&changed_targets, arguments, verbosity);
         }
-        trace("retaining the previous cache after unsuccessful formatting");
+        trace("retaining the previous cache after formatter errors or diagnostics");
         return Ok(output.status);
     }
 
-    let leaf_certificate = changed_leaves.as_ref().and_then(|leaves| {
-        (!output.emitted_diagnostics)
-            .then(|| read_leaf_certificate(&output.module_manifests, leaves).ok())
-            .flatten()
-    });
+    let leaf_certificate = changed_leaves
+        .as_ref()
+        .and_then(|leaves| read_leaf_certificate(&output.module_manifests, leaves).ok());
     let rewritten_leaf = leaf_certificate == Some(LeafCertificateKind::Rewritten);
     if let Some(leaves) = changed_leaves.as_ref() {
         if leaf_certificate == Some(LeafCertificateKind::Unchanged) {
@@ -399,7 +399,7 @@ pub(super) fn format(
             Some(cache_directory),
             None,
         )?;
-        if output.status != SUCCESS {
+        if output.status != SUCCESS || output.emitted_diagnostics {
             return Ok(output.status);
         }
         discovered = match read_module_manifests(&output.module_manifests, &changed_targets) {
