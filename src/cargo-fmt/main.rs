@@ -105,7 +105,7 @@ const FAILURE: i32 = 1;
 fn execute() -> i32 {
     // Drop extra `fmt` argument provided by `cargo`.
     let mut found_fmt = false;
-    let args = env::args().filter(|x| {
+    let args = env::args_os().filter(|x| {
         if found_fmt {
             true
         } else {
