@@ -637,11 +637,11 @@ fn run_rustfmt_with_output(
                 command.env("OHM_RUSTFMT_ALLOW_MODULE_WRITE", "1");
             }
         }
-        if output_mode != RustfmtOutputMode::Inherit {
+        if manifest_directory.is_some() || output_mode != RustfmtOutputMode::Inherit {
             command.stderr(std::process::Stdio::piped());
         }
 
-        let command = command.spawn().map_err(|e| match e.kind() {
+        let mut child = command.spawn().map_err(|e| match e.kind() {
             io::ErrorKind::NotFound => io::Error::new(
                 io::ErrorKind::Other,
                 "Could not run rustfmt, please make sure it is in your PATH.",
@@ -649,10 +649,23 @@ fn run_rustfmt_with_output(
             _ => e,
         })?;
 
-        let output = command.wait_with_output()?;
-        emitted_diagnostics |= !output.stderr.is_empty();
-        if !output.status.success() {
-            status = status.or_else(|| output.status.code());
+        let diagnostics = match child.stderr.take() {
+            Some(mut pipe) if output_mode == RustfmtOutputMode::Inherit => {
+                io::copy(&mut pipe, &mut io::stderr().lock())
+            }
+            Some(mut pipe) => io::copy(&mut pipe, &mut io::sink()),
+            None => Ok(0),
+        };
+        let edition_status = child.wait()?;
+        emitted_diagnostics |= diagnostics? != 0;
+        if !edition_status.success() {
+            status = status.or_else(|| edition_status.code());
+        }
+    }
+
+    if emitted_diagnostics {
+        for manifest in module_manifests.drain(..) {
+            let _ = fs::remove_file(manifest);
         }
     }
 
