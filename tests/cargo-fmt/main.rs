@@ -37,6 +37,21 @@ fn cargo_fmt_command() -> Command {
     command
 }
 
+#[cfg(unix)]
+#[test]
+fn non_unicode_manifest_path_is_reported() {
+    use std::os::unix::ffi::OsStrExt;
+
+    let output = cargo_fmt_command()
+        .args(["fmt", "--manifest-path"])
+        .arg(std::ffi::OsStr::from_bytes(b"\xff/Cargo.toml"))
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success());
+    assert!(stderr.contains("invalid UTF-8"), "{stderr}");
+}
+
 /// Run the cargo-fmt executable and return its output.
 fn cargo_fmt(args: &[&str]) -> (String, String) {
     let mut command = cargo_fmt_command();
