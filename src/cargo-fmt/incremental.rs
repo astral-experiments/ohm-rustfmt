@@ -12,8 +12,8 @@ use sha2::{Digest, Sha256};
 use crate::path_utils::{canonicalize, canonicalize_with_handle};
 
 use super::{
-    RustfmtOutput, RustfmtOutputMode, SUCCESS, Target, Verbosity, run_rustfmt,
-    run_rustfmt_with_output, rustfmt_command,
+    RustfmtOutput, RustfmtOutputMode, SUCCESS, Target, Verbosity, has_rustfmt_check, run_rustfmt,
+    run_rustfmt_with_output, rustfmt_command, rustfmt_options,
 };
 
 const CACHE_VERSION: u32 = 12;
@@ -421,7 +421,7 @@ pub(super) fn format(
     modules.extend(discovered.modules);
     leaves.extend(discovered.leaves);
     probes.extend(discovered.probes);
-    let check_only = arguments.iter().any(|argument| argument == "--check");
+    let check_only = has_rustfmt_check(arguments);
     match Snapshot::capture(
         targets,
         arguments,
@@ -682,19 +682,17 @@ fn discovers_new_shared_owner(
 /// Normalizes file-emission options before appending the otherwise incompatible `--check`.
 fn verification_arguments(arguments: &[String]) -> Vec<String> {
     let mut normalized = Vec::with_capacity(arguments.len() + 1);
-    let mut arguments = arguments.iter();
-    while let Some(argument) = arguments.next() {
-        if argument == "--emit" {
-            if let Some(mode) = arguments.next().filter(|mode| mode.as_str() != "files") {
-                normalized.push(argument.clone());
-                normalized.push(mode.clone());
-            }
-        } else if argument != "--emit=files" {
-            normalized.push(argument.clone());
+    for (argument, values) in rustfmt_options(arguments) {
+        if argument == "--emit=files"
+            || (argument == "--emit" && values.first().is_some_and(|mode| mode == "files"))
+        {
+            continue;
         }
+        normalized.push(argument.to_owned());
+        normalized.extend_from_slice(values);
     }
 
-    if !normalized.iter().any(|argument| argument == "--check") {
+    if !has_rustfmt_check(&normalized) {
         normalized.push(String::from("--check"));
     }
     normalized
@@ -1229,11 +1227,14 @@ fn invocation_key(targets: &BTreeSet<Target>, arguments: &[String]) -> io::Resul
 /// Shares successful read/write proofs without conflating any effective formatting options.
 fn hash_formatter_arguments(invocation: &mut Sha256, arguments: &[String]) {
     let mut skipped_check = false;
-    for argument in arguments {
+    for (argument, values) in rustfmt_options(arguments) {
         if argument == "--check" && !skipped_check {
             skipped_check = true;
         } else {
             hash_value(invocation, argument);
+        }
+        for value in values {
+            hash_value(invocation, value);
         }
     }
 }
@@ -1479,10 +1480,9 @@ fn collect_explicit_configuration(
     arguments: &[String],
     configuration: &mut BTreeMap<String, String>,
 ) -> io::Result<()> {
-    let mut arguments = arguments.iter();
-    while let Some(argument) = arguments.next() {
+    for (argument, values) in rustfmt_options(arguments) {
         let path = if argument == "--config-path" {
-            arguments.next().map(PathBuf::from)
+            values.first().map(PathBuf::from)
         } else {
             argument.strip_prefix("--config-path=").map(PathBuf::from)
         };
@@ -1862,11 +1862,10 @@ fn write_cache(path: &Path, snapshot: &Snapshot) -> io::Result<()> {
 
 /// Conservatively disables caching for output-producing flags and unaudited inline settings.
 fn has_observable_emit_mode(arguments: &[String]) -> bool {
-    let check_only = arguments.iter().any(|argument| argument == "--check");
-    let mut arguments = arguments.iter();
-    while let Some(argument) = arguments.next() {
+    let check_only = has_rustfmt_check(arguments);
+    for (argument, values) in rustfmt_options(arguments) {
         if matches!(
-            argument.as_str(),
+            argument,
             "--backup"
                 | "--print-config"
                 | "--config-help"
@@ -1890,7 +1889,7 @@ fn has_observable_emit_mode(arguments: &[String]) -> bool {
         {
             return true;
         } else if argument == "--emit" {
-            if check_only || arguments.next().is_none_or(|mode| mode != "files") {
+            if check_only || values.first().is_none_or(|mode| mode != "files") {
                 return true;
             }
         } else if argument
@@ -1899,8 +1898,8 @@ fn has_observable_emit_mode(arguments: &[String]) -> bool {
         {
             return true;
         } else if argument == "--config" {
-            if arguments
-                .next()
+            if values
+                .first()
                 .is_none_or(|configuration| !is_safe_inline_configuration(configuration))
             {
                 return true;
