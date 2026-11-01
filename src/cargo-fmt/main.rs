@@ -104,15 +104,9 @@ const FAILURE: i32 = 1;
 
 fn execute() -> i32 {
     // Drop extra `fmt` argument provided by `cargo`.
-    let mut found_fmt = false;
-    let args = env::args_os().filter(|x| {
-        if found_fmt {
-            true
-        } else {
-            found_fmt = x == "fmt";
-            x != "fmt"
-        }
-    });
+    let args = env::args_os()
+        .enumerate()
+        .filter_map(|(index, arg)| (index != 1 || arg != "fmt").then_some(arg));
 
     let opts = Opts::parse_from(args);
 

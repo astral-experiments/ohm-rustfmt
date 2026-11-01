@@ -52,6 +52,27 @@ fn non_unicode_manifest_path_is_reported() {
     assert!(stderr.contains("invalid UTF-8"), "{stderr}");
 }
 
+#[test]
+fn direct_invocation_accepts_a_package_named_fmt() -> std::io::Result<()> {
+    let project = tempfile::tempdir()?;
+    fs::write(
+        project.path().join("Cargo.toml"),
+        "[package]\nname = 'fmt'\nversion = '0.1.0'\nedition = '2021'\n\
+         [lib]\npath = 'lib.rs'\n[workspace]\n",
+    )?;
+    fs::write(project.path().join("lib.rs"), "pub fn format() {}\n")?;
+    let output = cargo_fmt_command()
+        .current_dir(project.path())
+        .args(["--package", "fmt", "--check"])
+        .output()?;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    Ok(())
+}
+
 /// Run the cargo-fmt executable and return its output.
 fn cargo_fmt(args: &[&str]) -> (String, String) {
     let mut command = cargo_fmt_command();
