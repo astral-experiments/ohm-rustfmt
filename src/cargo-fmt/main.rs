@@ -123,8 +123,8 @@ fn execute() -> i32 {
     if opts.version {
         return handle_command_status(get_rustfmt_info(&[String::from("--version")]));
     }
-    if opts.rustfmt_options.iter().any(|s| {
-        ["--print-config", "-h", "--help", "-V", "--version"].contains(&s.as_str())
+    if rustfmt_options(&opts.rustfmt_options).any(|(s, _)| {
+        matches!(s, "--print-config" | "-h" | "--help" | "-V" | "--version")
             || s.starts_with("--help=")
             || s.starts_with("--print-config=")
     }) {
@@ -133,11 +133,8 @@ fn execute() -> i32 {
 
     let strategy = CargoFmtStrategy::from_opts(&opts);
     let mut rustfmt_args = opts.rustfmt_options;
-    if opts.check {
-        let check_flag = "--check";
-        if !rustfmt_args.iter().any(|o| o == check_flag) {
-            rustfmt_args.push(check_flag.to_owned());
-        }
+    if opts.check && !has_rustfmt_check(&rustfmt_args) {
+        rustfmt_args.push(String::from("--check"));
     }
     if let Some(message_format) = opts.message_format {
         if let Err(msg) = convert_message_format_to_rustfmt_args(&message_format, &mut rustfmt_args)
@@ -184,6 +181,27 @@ fn rustfmt_command() -> Command {
     command
 }
 
+/// Groups forwarded rustfmt options with their values without changing the command line.
+fn rustfmt_options(mut arguments: &[String]) -> impl Iterator<Item = (&str, &[String])> {
+    std::iter::from_fn(move || {
+        let (option, rest) = arguments.split_first()?;
+        let value_count = match option.as_str() {
+            "--" => rest.len(),
+            "--color" | "--config" | "--config-path" | "--edition" | "--emit" | "--file-lines"
+            | "--print-config" | "--style-edition" => rest.len().min(1),
+            _ => 0,
+        };
+        let (values, tail) = rest.split_at(value_count);
+        arguments = tail;
+        Some((option.as_str(), values))
+    })
+}
+
+/// Returns whether rustfmt received a check flag outside an option value.
+fn has_rustfmt_check(arguments: &[String]) -> bool {
+    rustfmt_options(arguments).any(|(option, _)| option == "--check")
+}
+
 fn convert_message_format_to_rustfmt_args(
     message_format: &str,
     rustfmt_args: &mut Vec<String>,
@@ -191,8 +209,8 @@ fn convert_message_format_to_rustfmt_args(
     let mut contains_emit_mode = false;
     let mut contains_check = false;
     let mut contains_list_files = false;
-    for arg in rustfmt_args.iter() {
-        if arg.starts_with("--emit") {
+    for (arg, _) in rustfmt_options(rustfmt_args) {
+        if arg == "--emit" || arg.starts_with("--emit=") {
             contains_emit_mode = true;
         }
         if arg == "--check" {
@@ -627,7 +645,7 @@ fn run_rustfmt_with_output(
                 .join(",");
             command.env("OHM_RUSTFMT_CHANGED_MODULE", paths);
             command.env("OHM_RUSTFMT_MODULE_TOPOLOGY", topologies);
-            if modules.len() == 1 && !fmt_args.iter().any(|argument| argument == "--check") {
+            if modules.len() == 1 && !has_rustfmt_check(fmt_args) {
                 command.env("OHM_RUSTFMT_ALLOW_MODULE_WRITE", "1");
             }
         }

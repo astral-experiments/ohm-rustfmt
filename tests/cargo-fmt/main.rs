@@ -53,6 +53,30 @@ fn non_unicode_manifest_path_is_reported() {
 }
 
 #[test]
+fn check_preserves_source_with_flag_like_config_paths() -> std::io::Result<()> {
+    let project = tempfile::tempdir()?;
+    fs::write(
+        project.path().join("Cargo.toml"),
+        "[package]\nname = 'fixture'\nversion = '0.1.0'\nedition = '2021'\n\
+         [lib]\npath = 'lib.rs'\n",
+    )?;
+    let source = project.path().join("lib.rs");
+    let original = "pub fn example(){}\n";
+    fs::write(&source, original)?;
+    for config in ["--check", "--version"] {
+        fs::write(project.path().join(config), "max_width = 100\n")?;
+        let output = cargo_fmt_command()
+            .current_dir(project.path())
+            .args(["--check", "--", "--config-path", config])
+            .output()?;
+        assert_eq!(output.status.code(), Some(1), "{config}");
+        assert!(String::from_utf8_lossy(&output.stdout).contains("+pub fn example() {}"));
+        assert_eq!(fs::read_to_string(&source)?, original, "{config}");
+    }
+    Ok(())
+}
+
+#[test]
 fn direct_invocation_accepts_a_package_named_fmt() -> std::io::Result<()> {
     let project = tempfile::tempdir()?;
     fs::write(
