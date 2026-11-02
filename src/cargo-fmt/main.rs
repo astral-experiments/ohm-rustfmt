@@ -124,7 +124,8 @@ fn execute() -> i32 {
         return handle_command_status(get_rustfmt_info(&[String::from("--version")]));
     }
     if rustfmt_options(&opts.rustfmt_options).any(|(s, _)| {
-        matches!(s, "--print-config" | "-h" | "--help" | "-V" | "--version")
+        matches!(s, "--print-config" | "--help" | "--version")
+            || contains_short_flag(s, &['h', 'V'])
             || s.starts_with("--help=")
             || s.starts_with("--print-config=")
     }) {
@@ -208,6 +209,13 @@ fn rustfmt_options(mut arguments: &[String]) -> impl Iterator<Item = (&str, &[St
     })
 }
 
+/// Checks whether a single-dash rustfmt argument contains any of the given flags.
+fn contains_short_flag(argument: &str, flags: &[char]) -> bool {
+    argument
+        .strip_prefix('-')
+        .is_some_and(|short| !short.starts_with('-') && short.contains(flags))
+}
+
 /// Returns whether rustfmt received a check flag outside an option value.
 fn has_rustfmt_check(arguments: &[String]) -> bool {
     rustfmt_options(arguments).any(|(option, _)| option == "--check")
@@ -239,7 +247,7 @@ fn convert_message_format_to_rustfmt_args(
         if arg == "--check" {
             contains_check = true;
         }
-        if arg == "-l" || arg == "--files-with-diff" {
+        if arg == "--files-with-diff" || contains_short_flag(arg, &['l']) {
             contains_list_files = true;
         }
     }
