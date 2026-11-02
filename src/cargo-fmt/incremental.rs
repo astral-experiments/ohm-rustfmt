@@ -12,8 +12,8 @@ use sha2::{Digest, Sha256};
 use crate::path_utils::{canonicalize, canonicalize_with_handle};
 
 use super::{
-    RustfmtOutput, RustfmtOutputMode, SUCCESS, Target, Verbosity, has_rustfmt_check, run_rustfmt,
-    run_rustfmt_with_output, rustfmt_command, rustfmt_options,
+    RustfmtOutput, RustfmtOutputMode, SUCCESS, Target, Verbosity, add_rustfmt_options,
+    has_rustfmt_check, run_rustfmt, run_rustfmt_with_output, rustfmt_command, rustfmt_options,
 };
 
 const CACHE_VERSION: u32 = 12;
@@ -693,7 +693,7 @@ fn verification_arguments(arguments: &[String]) -> Vec<String> {
     }
 
     if !has_rustfmt_check(&normalized) {
-        normalized.push(String::from("--check"));
+        add_rustfmt_options(&mut normalized, &["--check"]);
     }
     normalized
 }
@@ -3769,6 +3769,10 @@ mod tests {
 
     #[test]
     fn verification_removes_explicit_file_emission_before_checking() {
+        assert_eq!(
+            verification_arguments(&[String::from("--emit=files"), String::from("--")]),
+            ["--check", "--"]
+        );
         assert_eq!(
             verification_arguments(&[String::from("--emit"), String::from("files")]),
             vec![String::from("--check")]

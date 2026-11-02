@@ -134,7 +134,7 @@ fn execute() -> i32 {
     let strategy = CargoFmtStrategy::from_opts(&opts);
     let mut rustfmt_args = opts.rustfmt_options;
     if opts.check && !has_rustfmt_check(&rustfmt_args) {
-        rustfmt_args.push(String::from("--check"));
+        add_rustfmt_options(&mut rustfmt_args, &["--check"]);
     }
     if let Some(message_format) = opts.message_format {
         if let Err(msg) = convert_message_format_to_rustfmt_args(&message_format, &mut rustfmt_args)
@@ -181,14 +181,25 @@ fn rustfmt_command() -> Command {
     command
 }
 
+/// Rustfmt options that consume the next argument when their value is passed separately.
+const RUSTFMT_VALUE_OPTIONS: &[&str] = &[
+    "--color",
+    "--config",
+    "--config-path",
+    "--edition",
+    "--emit",
+    "--file-lines",
+    "--print-config",
+    "--style-edition",
+];
+
 /// Groups forwarded rustfmt options with their values without changing the command line.
 fn rustfmt_options(mut arguments: &[String]) -> impl Iterator<Item = (&str, &[String])> {
     std::iter::from_fn(move || {
         let (option, rest) = arguments.split_first()?;
         let value_count = match option.as_str() {
             "--" => rest.len(),
-            "--color" | "--config" | "--config-path" | "--edition" | "--emit" | "--file-lines"
-            | "--print-config" | "--style-edition" => rest.len().min(1),
+            name if RUSTFMT_VALUE_OPTIONS.contains(&name) => rest.len().min(1),
             _ => 0,
         };
         let (values, tail) = rest.split_at(value_count);
@@ -200,6 +211,18 @@ fn rustfmt_options(mut arguments: &[String]) -> impl Iterator<Item = (&str, &[St
 /// Returns whether rustfmt received a check flag outside an option value.
 fn has_rustfmt_check(arguments: &[String]) -> bool {
     rustfmt_options(arguments).any(|(option, _)| option == "--check")
+}
+
+/// Inserts generated options before a terminator or an option missing its value.
+fn add_rustfmt_options(arguments: &mut Vec<String>, options: &[&str]) {
+    let mut index = 0;
+    for (name, values) in rustfmt_options(arguments) {
+        if name == "--" || (values.is_empty() && RUSTFMT_VALUE_OPTIONS.contains(&name)) {
+            break;
+        }
+        index += 1 + values.len();
+    }
+    arguments.splice(index..index, options.iter().copied().map(String::from));
 }
 
 fn convert_message_format_to_rustfmt_args(
@@ -223,7 +246,7 @@ fn convert_message_format_to_rustfmt_args(
     match message_format {
         "short" => {
             if !contains_list_files {
-                rustfmt_args.push(String::from("-l"));
+                add_rustfmt_options(rustfmt_args, &["-l"]);
             }
             Ok(())
         }
@@ -243,8 +266,7 @@ fn convert_message_format_to_rustfmt_args(
                     "cannot include --check arg when --message-format is set to json",
                 ));
             }
-            rustfmt_args.push(String::from("--emit"));
-            rustfmt_args.push(String::from("json"));
+            add_rustfmt_options(rustfmt_args, &["--emit", "json"]);
             Ok(())
         }
         "human" => Ok(()),

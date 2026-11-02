@@ -53,7 +53,7 @@ fn non_unicode_manifest_path_is_reported() {
 }
 
 #[test]
-fn check_preserves_source_with_flag_like_config_paths() -> std::io::Result<()> {
+fn check_preserves_source_with_forwarded_rustfmt_arguments() -> std::io::Result<()> {
     let project = tempfile::tempdir()?;
     fs::write(
         project.path().join("Cargo.toml"),
@@ -65,13 +65,20 @@ fn check_preserves_source_with_flag_like_config_paths() -> std::io::Result<()> {
     fs::write(&source, original)?;
     for config in ["--check", "--version"] {
         fs::write(project.path().join(config), "max_width = 100\n")?;
+    }
+    for args in [
+        ["--config-path", "--check"],
+        ["--config-path", "--version"],
+        ["--", "lib.rs"],
+    ] {
         let output = cargo_fmt_command()
             .current_dir(project.path())
-            .args(["--check", "--", "--config-path", config])
+            .args(["--check", "--"])
+            .args(args)
             .output()?;
-        assert_eq!(output.status.code(), Some(1), "{config}");
+        assert_eq!(output.status.code(), Some(1), "{args:?}");
         assert!(String::from_utf8_lossy(&output.stdout).contains("+pub fn example() {}"));
-        assert_eq!(fs::read_to_string(&source)?, original, "{config}");
+        assert_eq!(fs::read_to_string(&source)?, original, "{args:?}");
     }
     Ok(())
 }
