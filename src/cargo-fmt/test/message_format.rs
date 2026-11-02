@@ -92,9 +92,12 @@ fn short_message_format() {
 
 #[test]
 fn short_message_format_included_short_list_files_flag() {
-    let mut args = vec![String::from("--check"), String::from("-l")];
-    assert!(convert_message_format_to_rustfmt_args("short", &mut args).is_ok());
-    assert_eq!(args, vec![String::from("--check"), String::from("-l")]);
+    for flag in ["-l", "-ql", "-lq"] {
+        let expected = vec![String::from("--check"), String::from(flag)];
+        let mut args = expected.clone();
+        assert!(convert_message_format_to_rustfmt_args("short", &mut args).is_ok());
+        assert_eq!(args, expected);
+    }
 }
 
 #[test]

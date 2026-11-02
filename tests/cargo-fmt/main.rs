@@ -84,6 +84,22 @@ fn check_preserves_source_with_forwarded_rustfmt_arguments() -> std::io::Result<
 }
 
 #[test]
+fn clustered_rustfmt_version_needs_no_manifest() -> std::io::Result<()> {
+    let project = tempfile::tempdir()?;
+    let output = cargo_fmt_command()
+        .current_dir(project.path())
+        .args(["--", "-qV"])
+        .output()?;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stdout.starts_with(b"rustfmt "));
+    Ok(())
+}
+
+#[test]
 fn direct_invocation_accepts_a_package_named_fmt() -> std::io::Result<()> {
     let project = tempfile::tempdir()?;
     fs::write(

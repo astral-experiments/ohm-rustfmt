@@ -13,7 +13,8 @@ use crate::path_utils::{canonicalize, canonicalize_with_handle};
 
 use super::{
     RustfmtOutput, RustfmtOutputMode, SUCCESS, Target, Verbosity, add_rustfmt_options,
-    has_rustfmt_check, run_rustfmt, run_rustfmt_with_output, rustfmt_command, rustfmt_options,
+    contains_short_flag, has_rustfmt_check, run_rustfmt, run_rustfmt_with_output, rustfmt_command,
+    rustfmt_options,
 };
 
 const CACHE_VERSION: u32 = 12;
@@ -1880,12 +1881,7 @@ fn has_observable_emit_mode(arguments: &[String]) -> bool {
             || argument.starts_with("--help=")
             || argument.starts_with("--file-lines=")
             || argument == "--files-with-diff"
-            || (argument.starts_with('-')
-                && !argument.starts_with("--")
-                && argument
-                    .chars()
-                    .skip(1)
-                    .any(|flag| matches!(flag, 'v' | 'V' | 'h' | 'l')))
+            || contains_short_flag(argument, &['v', 'V', 'h', 'l'])
         {
             return true;
         } else if argument == "--emit" {
