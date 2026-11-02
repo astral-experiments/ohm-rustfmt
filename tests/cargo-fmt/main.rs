@@ -230,16 +230,18 @@ fn cargo_fmt_fails_when_rustfmt_is_terminated() -> std::io::Result<()> {
     let formatter = directory.path().join("rustfmt");
     fs::write(&formatter, "#!/bin/sh\nkill -TERM $$\n")?;
     fs::set_permissions(&formatter, fs::Permissions::from_mode(0o755))?;
-    let status = cargo_fmt_command()
-        .args([
-            "--check",
-            "--manifest-path",
-            "tests/cargo-fmt/source/issue_3164/Cargo.toml",
-        ])
-        .env("RUSTFMT", formatter)
-        .env("OHM_INCREMENTAL_FMT", "0")
-        .status()?;
-    assert!(!status.success());
+    let manifest = "tests/cargo-fmt/source/issue_3164/Cargo.toml";
+    for args in [
+        &["--version"][..],
+        &["--check", "--manifest-path", manifest],
+    ] {
+        let status = cargo_fmt_command()
+            .args(args)
+            .env("RUSTFMT", &formatter)
+            .env("OHM_INCREMENTAL_FMT", "0")
+            .status()?;
+        assert!(!status.success(), "cargo fmt {args:?} returned {status}");
+    }
     Ok(())
 }
 

@@ -321,12 +321,7 @@ fn get_rustfmt_info(args: &[String]) -> Result<i32, io::Error> {
             ),
             _ => e,
         })?;
-    let result = command.wait()?;
-    if result.success() {
-        Ok(SUCCESS)
-    } else {
-        Ok(result.code().unwrap_or(SUCCESS))
-    }
+    Ok(command.wait()?.code().unwrap_or(FAILURE))
 }
 
 fn format_crate(
