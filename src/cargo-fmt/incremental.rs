@@ -1184,16 +1184,10 @@ impl Snapshot {
 fn invocation_key(targets: &BTreeSet<Target>, arguments: &[String]) -> io::Result<String> {
     let current_directory = env::current_dir()?.canonicalize()?;
     let (formatter_path, compiler_path) = trusted_formatter()?;
-    let formatter_metadata = fs::metadata(&formatter_path)?;
-    let formatter_fingerprint = SourceFingerprint::from_metadata(&formatter_metadata)?;
     let mut invocation = Sha256::new();
     hash_value(&mut invocation, env!("CARGO_PKG_VERSION"));
     hash_value(&mut invocation, &path_string(&current_directory)?);
-    hash_value(&mut invocation, &path_string(&formatter_path)?);
-    invocation.update(formatter_fingerprint.modified_seconds.to_le_bytes());
-    invocation.update(formatter_fingerprint.modified_nanoseconds.to_le_bytes());
-    invocation.update(formatter_fingerprint.permissions_mode.to_le_bytes());
-    invocation.update(formatter_metadata.len().to_le_bytes());
+    hash_formatter(&mut invocation, &formatter_path)?;
     hash_compiler_driver(&mut invocation, &compiler_path)?;
 
     for variable in [
@@ -1541,7 +1535,7 @@ fn collect_configuration_file(
     if !configuration.contains_key(&key) {
         let canonical_path = path.canonicalize()?;
         let canonical = path_string(&canonical_path)?;
-        let digest = hash_configuration_file(&canonical_path)?;
+        let digest = hash_file_contents(&canonical_path)?;
         configuration.insert(key, format!("{canonical}:{digest}"));
     }
     Ok(())
@@ -1577,8 +1571,8 @@ fn reject_observable_formatter_configuration(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
-/// Streams configuration contents so even large lockfiles contribute exact cache identity.
-fn hash_configuration_file(path: &Path) -> io::Result<String> {
+/// Streams file contents so even large inputs contribute exact cache identity.
+fn hash_file_contents(path: &Path) -> io::Result<String> {
     let mut file = File::open(path)?;
     let mut digest = Sha256::new();
     let mut buffer = [0; 16 * 1024];
@@ -1686,14 +1680,27 @@ fn compiler_driver(compiler: &Path) -> io::Result<PathBuf> {
     driver.ok_or_else(|| unsupported("the formatter toolchain has no rustc driver library"))
 }
 
+/// Fingerprints the formatter even when a reinstall preserves its size and modification time.
+fn hash_formatter(digest: &mut Sha256, path: &Path) -> io::Result<()> {
+    hash_tool_metadata(digest, path)?;
+    #[cfg(not(unix))]
+    hash_value(digest, &hash_file_contents(path)?);
+    Ok(())
+}
+
 /// Fingerprints the real compiler implementation without reading its contents.
 fn hash_compiler_driver(digest: &mut Sha256, compiler: &Path) -> io::Result<()> {
     let path = compiler_driver(compiler)?;
     validate_compiler_driver_search_paths(&path)?;
-    let metadata = fs::metadata(&path)?;
+    hash_tool_metadata(digest, &path)
+}
+
+/// Includes Unix file identity and change time to detect replacements and in-place rewrites.
+fn hash_tool_metadata(digest: &mut Sha256, path: &Path) -> io::Result<()> {
+    let metadata = fs::metadata(path)?;
     let fingerprint = SourceFingerprint::from_metadata(&metadata)?;
 
-    hash_value(digest, &path_string(&path)?);
+    hash_value(digest, &path_string(path)?);
     digest.update(fingerprint.modified_seconds.to_le_bytes());
     digest.update(fingerprint.modified_nanoseconds.to_le_bytes());
     digest.update(fingerprint.permissions_mode.to_le_bytes());
@@ -3140,6 +3147,29 @@ mod tests {
         fs::rename(&replacement, &driver)?;
         let mut after = Sha256::new();
         hash_compiler_driver(&mut after, &compiler)?;
+
+        assert_ne!(before.finalize(), after.finalize());
+        Ok(())
+    }
+
+    #[test]
+    fn replacing_a_formatter_with_restored_mtime_changes_its_identity() -> io::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let formatter = directory.path().join("rustfmt");
+        fs::write(&formatter, "old formatter")?;
+        let modified = fs::metadata(&formatter)?.modified()?;
+        let mut before = Sha256::new();
+        hash_formatter(&mut before, &formatter)?;
+
+        let replacement = directory.path().join("replacement");
+        fs::write(&replacement, "new formatter")?;
+        OpenOptions::new()
+            .write(true)
+            .open(&replacement)?
+            .set_times(fs::FileTimes::new().set_modified(modified))?;
+        fs::rename(replacement, &formatter)?;
+        let mut after = Sha256::new();
+        hash_formatter(&mut after, &formatter)?;
 
         assert_ne!(before.finalize(), after.finalize());
         Ok(())
