@@ -10,7 +10,7 @@ use std::fs;
 use std::hash::{Hash, Hasher};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Child, Command};
 use std::str;
 
 use cargo_metadata::Edition;
@@ -37,6 +37,10 @@ const MESSAGE_FORMATS: &str = if is_nightly() {
 } else {
     "short|human"
 };
+
+const CHANGED_MODULE_ENVIRONMENT: &str = "OHM_RUSTFMT_CHANGED_MODULE";
+const MODULE_TOPOLOGY_ENVIRONMENT: &str = "OHM_RUSTFMT_MODULE_TOPOLOGY";
+const MODULE_WRITE_ENVIRONMENT: &str = "OHM_RUSTFMT_ALLOW_MODULE_WRITE";
 
 #[derive(Parser)]
 #[command(
@@ -631,23 +635,24 @@ fn run_rustfmt_with_output(
                 .map(|(_, topology)| topology.as_str())
                 .collect::<Vec<_>>()
                 .join(",");
-            command.env("OHM_RUSTFMT_CHANGED_MODULE", paths);
-            command.env("OHM_RUSTFMT_MODULE_TOPOLOGY", topologies);
+            command.env(CHANGED_MODULE_ENVIRONMENT, paths);
+            command.env(MODULE_TOPOLOGY_ENVIRONMENT, topologies);
             if modules.len() == 1 && !fmt_args.iter().any(|argument| argument == "--check") {
-                command.env("OHM_RUSTFMT_ALLOW_MODULE_WRITE", "1");
+                command.env(MODULE_WRITE_ENVIRONMENT, "1");
             }
         }
         if manifest_directory.is_some() || output_mode != RustfmtOutputMode::Inherit {
             command.stderr(std::process::Stdio::piped());
         }
 
-        let mut child = command.spawn().map_err(|e| match e.kind() {
-            io::ErrorKind::NotFound => io::Error::new(
-                io::ErrorKind::Other,
-                "Could not run rustfmt, please make sure it is in your PATH.",
-            ),
-            _ => e,
-        })?;
+        let mut child =
+            spawn_rustfmt(&mut command, changed_modules.is_some()).map_err(|e| match e.kind() {
+                io::ErrorKind::NotFound => io::Error::new(
+                    io::ErrorKind::Other,
+                    "Could not run rustfmt, please make sure it is in your PATH.",
+                ),
+                _ => e,
+            })?;
 
         let diagnostics = match child.stderr.take() {
             Some(mut pipe) if output_mode == RustfmtOutputMode::Inherit => {
@@ -674,6 +679,20 @@ fn run_rustfmt_with_output(
         emitted_diagnostics,
         module_manifests,
     })
+}
+
+/// Starts rustfmt with the full target if the OS rejects the optional module list.
+fn spawn_rustfmt(command: &mut Command, has_changed_modules: bool) -> io::Result<Child> {
+    match command.spawn() {
+        Err(error) if has_changed_modules && error.kind() == io::ErrorKind::ArgumentListTooLong => {
+            command
+                .env_remove(CHANGED_MODULE_ENVIRONMENT)
+                .env_remove(MODULE_TOPOLOGY_ENVIRONMENT)
+                .env_remove(MODULE_WRITE_ENVIRONMENT)
+                .spawn()
+        }
+        result => result,
+    }
 }
 
 fn get_cargo_metadata(manifest_path: Option<&Path>) -> Result<cargo_metadata::Metadata, io::Error> {
