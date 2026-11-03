@@ -1869,6 +1869,10 @@ fn has_observable_emit_mode(arguments: &[String]) -> bool {
             // Rustfmt must visit any named files, even if every Cargo target is unchanged.
             return !arguments.as_slice().is_empty();
         }
+        if !argument.starts_with('-') || argument == "-" {
+            // The snapshot only tracks files discovered from Cargo's targets.
+            return true;
+        }
         if matches!(
             argument.as_str(),
             "--backup"
@@ -3675,6 +3679,20 @@ mod tests {
         assert!(second.is_directory);
         assert_ne!(first, second);
         Ok(())
+    }
+
+    #[test]
+    fn bare_file_operands_require_full_formatting() {
+        assert!(has_observable_emit_mode(
+            &["--check", "extra.rs"].map(String::from)
+        ));
+        assert!(has_observable_emit_mode(
+            &["extra.rs", "--color", "never"].map(String::from)
+        ));
+        assert!(has_observable_emit_mode(&["-"].map(String::from)));
+        assert!(!has_observable_emit_mode(
+            &["--check", "--color", "never"].map(String::from)
+        ));
     }
 
     #[test]
