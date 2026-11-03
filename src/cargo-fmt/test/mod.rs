@@ -3,6 +3,36 @@ use super::*;
 mod message_format;
 mod targets;
 
+#[cfg(target_os = "linux")]
+#[test]
+fn oversized_module_environment_falls_back_to_the_full_target() -> io::Result<()> {
+    let mut command = Command::new(env::current_exe()?);
+    command
+        .arg("--list")
+        .stdout(std::process::Stdio::null())
+        .env(CHANGED_MODULE_ENVIRONMENT, "x".repeat(4 * 1024 * 1024))
+        .env(MODULE_TOPOLOGY_ENVIRONMENT, "topology")
+        .env(MODULE_WRITE_ENVIRONMENT, "1");
+
+    assert_eq!(
+        spawn_rustfmt(&mut command, false).unwrap_err().kind(),
+        io::ErrorKind::ArgumentListTooLong
+    );
+    assert!(spawn_rustfmt(&mut command, true)?.wait()?.success());
+    for name in [
+        CHANGED_MODULE_ENVIRONMENT,
+        MODULE_TOPOLOGY_ENVIRONMENT,
+        MODULE_WRITE_ENVIRONMENT,
+    ] {
+        assert!(
+            !command
+                .get_envs()
+                .any(|(key, value)| key == name && value.is_some())
+        );
+    }
+    Ok(())
+}
+
 #[test]
 fn default_options() {
     let empty: Vec<String> = vec![];
