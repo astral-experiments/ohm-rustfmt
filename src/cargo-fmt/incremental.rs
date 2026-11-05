@@ -1188,7 +1188,8 @@ fn invocation_key(targets: &BTreeSet<Target>, arguments: &[String]) -> io::Resul
     hash_value(&mut invocation, env!("CARGO_PKG_VERSION"));
     hash_value(&mut invocation, &path_string(&current_directory)?);
     hash_formatter(&mut invocation, &formatter_path)?;
-    hash_compiler_driver(&mut invocation, &compiler_path)?;
+    let driver = hash_compiler_driver(&mut invocation, &compiler_path)?;
+    hash_compiler_driver_search_paths(&mut invocation, &driver)?;
 
     for variable in [
         "APPDATA",
@@ -1634,22 +1635,13 @@ fn trusted_formatter() -> io::Result<(PathBuf, PathBuf)> {
     Ok((path, compiler.canonicalize()?))
 }
 
-/// Locates the compiler implementation loaded dynamically by rustfmt.
-///
-/// The neighboring compiler can itself be a symlink, as in bootstrap tool
-/// bundles, so its canonical location determines the actual runtime sysroot.
-fn compiler_driver(compiler: &Path) -> io::Result<PathBuf> {
-    let compiler = compiler.canonicalize()?;
-    let sysroot = compiler
-        .parent()
-        .and_then(Path::parent)
-        .ok_or_else(|| unsupported("the formatter compiler has no runtime sysroot"))?;
-    let library_directory = sysroot.join(if cfg!(windows) { "bin" } else { "lib" });
+/// Locates the compiler implementation in the formatter's runtime directory.
+fn compiler_driver(library_directory: &Path) -> io::Result<PathBuf> {
     let prefix = format!("{}rustc_driver-", env::consts::DLL_PREFIX);
     let suffix = env::consts::DLL_SUFFIX;
     let mut driver = None;
 
-    for entry in fs::read_dir(&library_directory)? {
+    for entry in fs::read_dir(library_directory)? {
         let entry = entry?;
         let name = entry.file_name();
         let Some(name) = name.to_str() else {
@@ -1688,11 +1680,48 @@ fn hash_formatter(digest: &mut Sha256, path: &Path) -> io::Result<()> {
     Ok(())
 }
 
-/// Fingerprints the real compiler implementation without reading its contents.
-fn hash_compiler_driver(digest: &mut Sha256, compiler: &Path) -> io::Result<()> {
-    let path = compiler_driver(compiler)?;
-    validate_compiler_driver_search_paths(&path)?;
-    hash_tool_metadata(digest, &path)
+/// Fingerprints the compiler driver and its bundled dependencies, following bootstrap symlinks.
+fn hash_compiler_driver(digest: &mut Sha256, compiler: &Path) -> io::Result<PathBuf> {
+    let compiler = compiler.canonicalize()?;
+    let sysroot = compiler
+        .parent()
+        .and_then(Path::parent)
+        .ok_or_else(|| unsupported("the formatter compiler has no runtime sysroot"))?;
+    let directory = sysroot
+        .join(if cfg!(windows) { "bin" } else { "lib" })
+        .canonicalize()?;
+    let driver = compiler_driver(&directory)?;
+    hash_tool_metadata(digest, &driver)?;
+    hash_runtime_libraries(digest, &directory)?;
+    if let Some(parent) = driver.parent().filter(|&parent| parent != directory) {
+        hash_runtime_libraries(digest, parent)?;
+    }
+    Ok(driver)
+}
+
+/// Records runtime entries in loader-independent order and defers nested loader layouts to rustfmt.
+fn hash_runtime_libraries(digest: &mut Sha256, directory: &Path) -> io::Result<()> {
+    let mut files = Vec::new();
+    for entry in fs::read_dir(directory)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.is_dir() {
+            // rustlib contains target-specific compilation inputs. Cargo can also add a
+            // directory inside it to the loader path, which we fingerprint separately.
+            if entry.file_name() == "rustlib" {
+                continue;
+            }
+            return Err(unsupported(
+                "a nested directory can supply formatter libraries",
+            ));
+        }
+        files.push(path);
+    }
+    files.sort_unstable();
+    for path in files {
+        hash_tool_metadata(digest, &path)?;
+    }
+    Ok(())
 }
 
 /// Includes Unix file identity and change time to detect replacements and in-place rewrites.
@@ -1719,19 +1748,22 @@ fn hash_tool_metadata(digest: &mut Sha256, path: &Path) -> io::Result<()> {
     Ok(())
 }
 
-/// Rejects dynamic-loader directories that can replace the trusted driver.
-///
-/// Hashing only the search-path environment string cannot detect a library
-/// appearing inside an otherwise unchanged directory after a cache is warmed.
-fn validate_compiler_driver_search_paths(driver: &Path) -> io::Result<()> {
+/// Accounts for explicit loader paths that could replace a formatter dependency.
+fn hash_compiler_driver_search_paths(digest: &mut Sha256, driver: &Path) -> io::Result<()> {
     for variable in [
         "DYLD_LIBRARY_PATH",
         "DYLD_FALLBACK_LIBRARY_PATH",
         "LD_LIBRARY_PATH",
     ] {
         if let Some(paths) = env::var_os(variable) {
+            // The loader can expand tokens or use a separator that split_paths doesn't recognize.
+            if paths.to_string_lossy().contains(['$', '@', ';']) {
+                return Err(unsupported(
+                    "a library search path requires loader expansion",
+                ));
+            }
             for directory in env::split_paths(&paths) {
-                validate_compiler_driver_search_directory(driver, &directory)?;
+                hash_compiler_driver_search_directory(digest, driver, &directory)?;
             }
         }
     }
@@ -1739,15 +1771,57 @@ fn validate_compiler_driver_search_paths(driver: &Path) -> io::Result<()> {
     #[cfg(windows)]
     if let Some(paths) = env::var_os("PATH") {
         for directory in env::split_paths(&paths) {
-            validate_compiler_driver_search_directory(driver, &directory)?;
+            validate_driver_candidate(driver, &directory)?;
         }
     }
 
     Ok(())
 }
 
-/// Allows absent candidates or aliases of the verified driver, rejecting replacements.
-fn validate_compiler_driver_search_directory(driver: &Path, directory: &Path) -> io::Result<()> {
+/// Hashes toolchain search directories and checks external directories for competing libraries.
+fn hash_compiler_driver_search_directory(
+    digest: &mut Sha256,
+    driver: &Path,
+    directory: &Path,
+) -> io::Result<()> {
+    validate_driver_candidate(driver, directory)?;
+    let directory = if directory.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        directory
+    };
+    let directory = match directory.canonicalize() {
+        Ok(directory) => directory,
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+            ) =>
+        {
+            return Ok(());
+        }
+        Err(error) => return Err(error),
+    };
+    if let Some(lib) = driver.parent().filter(|&lib| directory.starts_with(lib)) {
+        if directory != lib {
+            hash_runtime_libraries(digest, &directory)?;
+        }
+        return Ok(());
+    }
+    // A new LLVM, zlib, or other dependency can change whether rustfmt starts,
+    // even when the formatter, compiler driver, and search-path string are unchanged.
+    for entry in fs::read_dir(directory)? {
+        if Some(entry?.file_name().as_os_str()) != driver.file_name() {
+            return Err(unsupported(
+                "a library search path can supply other formatter dependencies",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Rejects a compiler driver other than the one in the formatter's toolchain.
+fn validate_driver_candidate(driver: &Path, directory: &Path) -> io::Result<()> {
     let name = driver
         .file_name()
         .ok_or_else(|| unsupported("the formatter compiler driver has no filename"))?;
@@ -3009,12 +3083,17 @@ mod tests {
     fn exactly_one_runtime_compiler_driver_is_required() -> io::Result<()> {
         let (_directory, compiler, driver) = compiler_driver_fixture()?;
         assert_eq!(
-            compiler_driver(&compiler).err().map(|error| error.kind()),
+            hash_compiler_driver(&mut Sha256::new(), &compiler)
+                .err()
+                .map(|error| error.kind()),
             Some(io::ErrorKind::Unsupported)
         );
 
         fs::write(&driver, "compiler implementation")?;
-        assert_eq!(compiler_driver(&compiler)?, driver.canonicalize()?);
+        assert_eq!(
+            hash_compiler_driver(&mut Sha256::new(), &compiler)?,
+            driver.canonicalize()?
+        );
 
         let another = driver.with_file_name(format!(
             "{}rustc_driver-another{}",
@@ -3023,7 +3102,9 @@ mod tests {
         ));
         fs::write(&another, "ambiguous compiler implementation")?;
         assert_eq!(
-            compiler_driver(&compiler).err().map(|error| error.kind()),
+            hash_compiler_driver(&mut Sha256::new(), &compiler)
+                .err()
+                .map(|error| error.kind()),
             Some(io::ErrorKind::Unsupported)
         );
 
@@ -3031,28 +3112,81 @@ mod tests {
         fs::remove_file(&driver)?;
         fs::create_dir(&driver)?;
         assert_eq!(
-            compiler_driver(&compiler).err().map(|error| error.kind()),
+            hash_compiler_driver(&mut Sha256::new(), &compiler)
+                .err()
+                .map(|error| error.kind()),
             Some(io::ErrorKind::Unsupported)
         );
         Ok(())
     }
 
     #[test]
+    fn bundled_library_changes_invalidate_the_compiler_fingerprint() -> io::Result<()> {
+        let (_directory, compiler, driver) = compiler_driver_fixture()?;
+        fs::write(&driver, "compiler driver")?;
+        let library = driver.with_file_name(format!(
+            "{}LLVM{}",
+            env::consts::DLL_PREFIX,
+            env::consts::DLL_SUFFIX
+        ));
+        let fingerprint = || -> io::Result<_> {
+            let mut digest = Sha256::new();
+            hash_compiler_driver(&mut digest, &compiler)?;
+            Ok(digest.finalize())
+        };
+
+        let missing = fingerprint()?;
+        fs::write(&library, "complete runtime")?;
+        let healthy = fingerprint()?;
+        assert_ne!(missing, healthy);
+        fs::write(&library, "partial")?;
+        assert_ne!(healthy, fingerprint()?);
+        fs::remove_file(library)?;
+        assert_eq!(missing, fingerprint()?);
+        Ok(())
+    }
+
+    #[test]
+    fn a_new_formatter_dependency_in_a_loader_directory_prevents_cache_reuse() -> io::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let library = directory.path().join("lib");
+        fs::create_dir(&library)?;
+        let driver = library.join("driver");
+        fs::write(&driver, "toolchain driver")?;
+        let external = directory.path().join("external");
+        fs::create_dir(&external)?;
+        hash_compiler_driver_search_directory(&mut Sha256::new(), &driver, &external)?;
+
+        let dependency = external.join("libz.so.1");
+        fs::write(&dependency, "partial library update")?;
+        assert!(
+            hash_compiler_driver_search_directory(&mut Sha256::new(), &driver, &external).is_err()
+        );
+        fs::remove_file(dependency)?;
+        hash_compiler_driver_search_directory(&mut Sha256::new(), &driver, &external)
+    }
+
+    #[test]
     fn dynamic_library_search_directories_cannot_replace_compiler_drivers() -> io::Result<()> {
         let (directory, compiler, driver) = compiler_driver_fixture()?;
         fs::write(&driver, "expected compiler implementation")?;
-        let driver = compiler_driver(&compiler)?;
+        let driver = hash_compiler_driver(&mut Sha256::new(), &compiler)?;
         let search_directory = directory.path().join("search-directory");
         fs::create_dir(&search_directory)?;
 
-        validate_compiler_driver_search_directory(&driver, &search_directory)?;
-        validate_compiler_driver_search_directory(
+        hash_compiler_driver_search_directory(&mut Sha256::new(), &driver, &search_directory)?;
+        hash_compiler_driver_search_directory(
+            &mut Sha256::new(),
             &driver,
             driver
                 .parent()
                 .ok_or_else(|| io::Error::other("driver has no library directory"))?,
         )?;
-        validate_compiler_driver_search_directory(&driver, &directory.path().join("missing"))?;
+        hash_compiler_driver_search_directory(
+            &mut Sha256::new(),
+            &driver,
+            &directory.path().join("missing"),
+        )?;
 
         let alternate = search_directory.join(
             driver
@@ -3061,7 +3195,7 @@ mod tests {
         );
         fs::write(&alternate, "substituted compiler implementation")?;
         assert_eq!(
-            validate_compiler_driver_search_directory(&driver, &search_directory)
+            hash_compiler_driver_search_directory(&mut Sha256::new(), &driver, &search_directory)
                 .err()
                 .map(|error| error.kind()),
             Some(io::ErrorKind::Unsupported)
@@ -3070,7 +3204,7 @@ mod tests {
         fs::remove_file(&alternate)?;
         fs::create_dir(&alternate)?;
         assert_eq!(
-            validate_compiler_driver_search_directory(&driver, &search_directory)
+            hash_compiler_driver_search_directory(&mut Sha256::new(), &driver, &search_directory)
                 .err()
                 .map(|error| error.kind()),
             Some(io::ErrorKind::Unsupported)
@@ -3085,7 +3219,7 @@ mod tests {
 
         let (directory, compiler, driver) = compiler_driver_fixture()?;
         fs::write(&driver, "expected compiler implementation")?;
-        let driver = compiler_driver(&compiler)?;
+        let driver = hash_compiler_driver(&mut Sha256::new(), &compiler)?;
         let search_directory = directory.path().join("search-directory");
         fs::create_dir(&search_directory)?;
         let alias = search_directory.join(
@@ -3095,7 +3229,7 @@ mod tests {
         );
         symlink(&driver, alias)?;
 
-        validate_compiler_driver_search_directory(&driver, &search_directory)
+        hash_compiler_driver_search_directory(&mut Sha256::new(), &driver, &search_directory)
     }
 
     #[cfg(unix)]
@@ -3110,7 +3244,10 @@ mod tests {
         let linked_compiler = bundle.join("rustc");
         symlink(&compiler, &linked_compiler)?;
 
-        assert_eq!(compiler_driver(&linked_compiler)?, driver.canonicalize()?);
+        assert_eq!(
+            hash_compiler_driver(&mut Sha256::new(), &linked_compiler)?,
+            driver.canonicalize()?
+        );
         Ok(())
     }
 
