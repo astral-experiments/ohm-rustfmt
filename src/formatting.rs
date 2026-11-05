@@ -101,27 +101,23 @@ fn format_leaf_project<T: FormatHandler>(
     config: &Config,
     handler: &mut T,
 ) -> Result<Option<(FormatReport, String, bool)>, ErrorKind> {
-    if !preflight_direct_module(root, leaf, expected_topology, config)? {
+    // Keep speculative diagnostics silent until ownership is known. Reuse the
+    // accepted parse so clean leaves do not need a second root/module parse.
+    let mut configuration = config.clone();
+    configuration.set().show_parse_errors(false);
+    let psess = ParseSess::new(&configuration, false)?;
+    let Ok(krate) = Parser::parse_crate(Input::File(root.to_owned()), &psess) else {
+        return Ok(None);
+    };
+    let Ok((attributes, items, span)) =
+        Parser::parse_file_as_module(&psess, leaf, krate.spans.inner_span)
+    else {
+        return Ok(None);
+    };
+    if psess.emitted_diagnostics() {
         return Ok(None);
     }
 
-    let psess = ParseSess::new(config, false)?;
-    let mut report = FormatReport::new();
-    let krate = match Parser::parse_crate(Input::File(root.to_owned()), &psess) {
-        Ok(krate) => krate,
-        Err(_) => {
-            report.add_parsing_error();
-            return Ok(Some((report, String::new(), psess.emitted_diagnostics())));
-        }
-    };
-    let (attributes, items, span) =
-        match Parser::parse_file_as_module(&psess, leaf, krate.spans.inner_span) {
-            Ok(module) => module,
-            Err(_) => {
-                report.add_parsing_error();
-                return Ok(Some((report, String::new(), psess.emitted_diagnostics())));
-            }
-        };
     let module = Module::new(
         span,
         Some(Cow::Owned(ast::ModKind::Unloaded)),
@@ -137,7 +133,7 @@ fn format_leaf_project<T: FormatHandler>(
 
     let root_file = FileName::Real(root.to_owned());
     let leaf_file = FileName::Real(leaf.to_owned());
-    let mut context = FormatContext::new(&krate, report, psess, config, handler);
+    let mut context = FormatContext::new(&krate, FormatReport::new(), psess, config, handler);
     if should_skip_module(config, &context, false, &root_file, &leaf_file, &module) {
         return Ok(None);
     }
@@ -148,37 +144,6 @@ fn format_leaf_project<T: FormatHandler>(
     }
     let emitted_diagnostics = context.psess.emitted_diagnostics();
     Ok(Some((context.report, topology, emitted_diagnostics)))
-}
-
-/// Checks speculative ownership without writing files or duplicating parser diagnostics.
-fn preflight_direct_module(
-    root: &Path,
-    leaf: &Path,
-    expected_topology: Option<&str>,
-    config: &Config,
-) -> Result<bool, ErrorKind> {
-    let mut configuration = config.clone();
-    configuration.set().show_parse_errors(false);
-    let psess = ParseSess::new(&configuration, false)?;
-    let Ok(krate) = Parser::parse_crate(Input::File(root.to_owned()), &psess) else {
-        return Ok(false);
-    };
-    let Ok((attributes, items, span)) =
-        Parser::parse_file_as_module(&psess, leaf, krate.spans.inner_span)
-    else {
-        return Ok(false);
-    };
-    if psess.emitted_diagnostics() {
-        return Ok(false);
-    }
-
-    let module = Module::new(
-        span,
-        Some(Cow::Owned(ast::ModKind::Unloaded)),
-        Cow::Owned(items),
-        Cow::Owned(attributes),
-    );
-    Ok(direct_root_module_topology(&krate, root, leaf, &module).as_deref() == expected_topology)
 }
 
 /// Requires an unannotated direct declaration with ordinary, unambiguous ownership.
