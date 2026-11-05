@@ -71,7 +71,7 @@ impl RecordedFileProbes {
         }
 
         let canonical = if exists {
-            match path.canonicalize() {
+            match crate::path_utils::canonicalize(&path) {
                 Ok(canonical) if canonical.to_str().is_some() => Some(canonical),
                 _ => {
                     self.complete.store(false, Ordering::Release);
