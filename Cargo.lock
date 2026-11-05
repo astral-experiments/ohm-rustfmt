@@ -595,6 +595,7 @@ dependencies = [
  "getopts",
  "ignore",
  "itertools",
+ "memchr",
  "regex",
  "rustfmt-config_proc_macro",
  "rustix",
