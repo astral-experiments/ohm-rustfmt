@@ -10,7 +10,7 @@ use tracing_subscriber::EnvFilter;
 
 use std::collections::HashMap;
 use std::env;
-use std::fs::File;
+use std::fs::{self, File};
 use std::io::{self, Read, Write, stdout};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -24,6 +24,8 @@ use crate::rustfmt::{
 
 const BUG_REPORT_URL: &str = "https://github.com/rust-lang/rustfmt/issues/new?labels=bug";
 const MODULE_MANIFEST_ENVIRONMENT: &str = "OHM_RUSTFMT_MODULE_MANIFEST";
+const CHANGED_MODULE_ENVIRONMENT: &str = "OHM_RUSTFMT_CHANGED_MODULE";
+const MODULE_TOPOLOGY_ENVIRONMENT: &str = "OHM_RUSTFMT_MODULE_TOPOLOGY";
 
 // N.B. these crates are loaded from the sysroot, so they need extern crate.
 extern crate rustc_driver;
@@ -347,6 +349,13 @@ fn format(
     let mut session = Session::new(config, Some(out));
     let module_manifest = env::var_os(MODULE_MANIFEST_ENVIRONMENT).map(PathBuf::from);
     let expected_roots = module_manifest.as_ref().map(|_| files.clone());
+    let changed_module = module_manifest
+        .as_ref()
+        .filter(|_| files.len() == 1)
+        .and_then(|_| env::var_os(CHANGED_MODULE_ENVIRONMENT))
+        .map(PathBuf::from)
+        .zip(env::var(MODULE_TOPOLOGY_ENVIRONMENT).ok());
+    let mut certified_leaf = None;
     if module_manifest.is_some() {
         session.enable_module_graph();
     }
@@ -373,11 +382,23 @@ fn format(
                     }
                 }
 
-                session.override_config(local_config, |sess| {
-                    format_and_emit_report(sess, Input::File(file))
+                certified_leaf = session.override_config(local_config, |session| {
+                    format_target(
+                        session,
+                        file,
+                        changed_module
+                            .as_ref()
+                            .map(|(module, topology)| (module.as_path(), topology.as_str())),
+                    )
                 });
             } else {
-                format_and_emit_report(&mut session, Input::File(file));
+                certified_leaf = format_target(
+                    &mut session,
+                    file,
+                    changed_module
+                        .as_ref()
+                        .map(|(module, topology)| (module.as_path(), topology.as_str())),
+                );
             }
         }
     }
@@ -403,9 +424,60 @@ fn format(
         // formatting. They must never change rustfmt's diagnostics or status.
         // Some macro rewrites intentionally fail silently without affecting
         // rustfmt's successful public exit status.
-        let _ = session.write_module_manifest(&path, &roots);
+        if let Some((root, leaf, topology)) = certified_leaf {
+            let _ = session.write_leaf_certificate(&path, &root, &leaf, &topology);
+        } else {
+            let _ = session.write_module_manifest(&path, &roots);
+        }
     }
     Ok(exit_code)
+}
+
+/// Falls back before modifying files whenever a requested leaf loses its root context.
+fn format_target<T: Write>(
+    session: &mut Session<'_, T>,
+    root: PathBuf,
+    changed_module: Option<(&Path, &str)>,
+) -> Option<(PathBuf, PathBuf, String)> {
+    let Some((leaf, topology)) = changed_module else {
+        format_and_emit_report(session, Input::File(root));
+        return None;
+    };
+    let original = fs::read(leaf).ok();
+
+    match session.format_module(&root, leaf, topology) {
+        Ok(Some(report)) => {
+            let has_warnings = report.has_warnings();
+            let unchanged = original.is_some_and(|original| {
+                fs::read(leaf).is_ok_and(|formatted| formatted == original)
+            });
+            if !has_warnings && session.has_no_visible_errors() && unchanged {
+                return Some((root, leaf.to_owned(), String::from(topology)));
+            }
+            if !session.has_operational_errors()
+                && !session.has_parsing_errors()
+                && !session.has_check_errors()
+                && !session.has_diff()
+            {
+                // A rewritten or otherwise uncertified module proves nothing about its
+                // siblings. Let the authoritative root pass emit any warnings once.
+                format_and_emit_report(session, Input::File(root));
+            } else if has_warnings {
+                eprintln!(
+                    "{}",
+                    FormatReportFormatterBuilder::new(&report)
+                        .enable_colors(should_print_with_colors(session))
+                        .build()
+                );
+            }
+        }
+        Ok(None) => format_and_emit_report(session, Input::File(root)),
+        Err(message) => {
+            eprintln!("Error writing files: {message}");
+            session.add_operational_error();
+        }
+    }
+    None
 }
 
 fn format_and_emit_report<T: Write>(session: &mut Session<'_, T>, input: Input) {
