@@ -16,6 +16,8 @@ use std::str;
 use cargo_metadata::Edition;
 use clap::{CommandFactory, Parser};
 
+mod incremental;
+
 #[path = "test/mod.rs"]
 #[cfg(test)]
 mod cargo_fmt_tests;
@@ -281,12 +283,16 @@ fn format_crate(
 ) -> Result<i32, io::Error> {
     let targets = get_targets(strategy, manifest_path)?;
 
+    if incremental::enabled() {
+        return incremental::format(&targets, &rustfmt_args, verbosity, manifest_path);
+    }
+
     // Currently only bin and lib files get formatted.
     run_rustfmt(&targets, &rustfmt_args, verbosity)
 }
 
 /// Target uses a `path` field for equality and hashing.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Target {
     /// A path to the main source file of the target.
     path: PathBuf,
@@ -294,17 +300,24 @@ pub struct Target {
     kind: String,
     /// Rust edition for this target.
     edition: Edition,
+    /// Root directory of the Cargo package that owns this target.
+    package_root: PathBuf,
 }
 
 impl Target {
-    pub fn from_target(target: &cargo_metadata::Target) -> Self {
+    pub fn from_target(target: &cargo_metadata::Target, manifest_path: &Path) -> Self {
         let path = PathBuf::from(&target.src_path);
         let canonicalized = fs::canonicalize(&path).unwrap_or(path);
+        let package_root = manifest_path
+            .parent()
+            .map(|path| fs::canonicalize(path).unwrap_or_else(|_| path.to_owned()))
+            .unwrap_or_default();
 
         Target {
             path: canonicalized,
             kind: target.kind[0].to_string(),
             edition: target.edition,
+            package_root,
         }
     }
 }
@@ -401,8 +414,8 @@ fn get_targets_root_only(
         )
     };
 
-    let package_targets = match metadata.packages.len() {
-        1 => metadata.packages.into_iter().next().unwrap().targets,
+    let packages = match metadata.packages.len() {
+        1 => metadata.packages,
         _ => metadata
             .packages
             .into_iter()
@@ -413,12 +426,15 @@ fn get_targets_root_only(
                         .unwrap_or_default()
                         == current_dir_manifest
             })
-            .flat_map(|p| p.targets)
             .collect(),
     };
 
-    for target in package_targets {
-        targets.insert(Target::from_target(&target));
+    for package in packages {
+        add_targets(
+            &package.targets,
+            package.manifest_path.as_std_path(),
+            targets,
+        );
     }
 
     Ok(())
@@ -431,7 +447,11 @@ fn get_targets_recursive(
 ) -> Result<(), io::Error> {
     let metadata = get_cargo_metadata(manifest_path)?;
     for package in &metadata.packages {
-        add_targets(&package.targets, targets);
+        add_targets(
+            &package.targets,
+            package.manifest_path.as_std_path(),
+            targets,
+        );
 
         // Look for local dependencies using information available since cargo v1.51
         // It's theoretically possible someone could use a newer version of rustfmt with
@@ -471,9 +491,11 @@ fn get_targets_with_hitlist(
 
     for package in metadata.packages {
         if workspace_hitlist.remove(package.name.as_ref()) {
-            for target in package.targets {
-                targets.insert(Target::from_target(&target));
-            }
+            add_targets(
+                &package.targets,
+                package.manifest_path.as_std_path(),
+                targets,
+            );
         }
     }
 
@@ -488,9 +510,13 @@ fn get_targets_with_hitlist(
     }
 }
 
-fn add_targets(target_paths: &[cargo_metadata::Target], targets: &mut BTreeSet<Target>) {
+fn add_targets(
+    target_paths: &[cargo_metadata::Target],
+    manifest_path: &Path,
+    targets: &mut BTreeSet<Target>,
+) {
     for target in target_paths {
-        targets.insert(Target::from_target(target));
+        targets.insert(Target::from_target(target, manifest_path));
     }
 }
 
@@ -499,6 +525,38 @@ fn run_rustfmt(
     fmt_args: &[String],
     verbosity: Verbosity,
 ) -> Result<i32, io::Error> {
+    Ok(run_rustfmt_with_output(
+        targets,
+        fmt_args,
+        verbosity,
+        RustfmtOutputMode::Inherit,
+        None,
+    )?
+    .status)
+}
+
+/// Keeps ordinary formatter output visible while allowing a silent verification pass.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RustfmtOutputMode {
+    Inherit,
+    CaptureQuietly,
+}
+
+/// Combines subprocess status, captured diagnostics, and edition-specific module graphs.
+struct RustfmtOutput {
+    status: i32,
+    emitted_diagnostics: bool,
+    module_manifests: Vec<PathBuf>,
+}
+
+/// Runs each edition independently without changing ordinary stdout/stderr ordering.
+fn run_rustfmt_with_output(
+    targets: &BTreeSet<Target>,
+    fmt_args: &[String],
+    verbosity: Verbosity,
+    output_mode: RustfmtOutputMode,
+    manifest_directory: Option<&Path>,
+) -> Result<RustfmtOutput, io::Error> {
     let by_edition = targets
         .iter()
         .inspect(|t| {
@@ -511,13 +569,16 @@ fn run_rustfmt(
             h
         });
 
-    let mut status = vec![];
+    let mut status = None;
+    let mut emitted_diagnostics = false;
+    let mut module_manifests = Vec::new();
     for (edition, files) in by_edition {
-        let stdout = if verbosity == Verbosity::Quiet {
-            std::process::Stdio::null()
-        } else {
-            std::process::Stdio::inherit()
-        };
+        let stdout =
+            if verbosity == Verbosity::Quiet || output_mode == RustfmtOutputMode::CaptureQuietly {
+                std::process::Stdio::null()
+            } else {
+                std::process::Stdio::inherit()
+            };
 
         if verbosity == Verbosity::Verbose {
             print!("rustfmt");
@@ -527,28 +588,51 @@ fn run_rustfmt(
             println!();
         }
 
-        let mut command = rustfmt_command()
+        let mut command = rustfmt_command();
+        command
             .stdout(stdout)
             .args(files)
             .args(["--edition", edition.as_str()])
-            .args(fmt_args)
-            .spawn()
-            .map_err(|e| match e.kind() {
-                io::ErrorKind::NotFound => io::Error::new(
-                    io::ErrorKind::Other,
-                    "Could not run rustfmt, please make sure it is in your PATH.",
-                ),
-                _ => e,
-            })?;
+            .args(fmt_args);
 
-        status.push(command.wait()?);
+        if let Some(directory) = manifest_directory {
+            let manifest = directory.join(format!(
+                ".modules-{}-{}.json",
+                std::process::id(),
+                edition.as_str()
+            ));
+            match fs::remove_file(&manifest) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+            command.env("OHM_RUSTFMT_MODULE_MANIFEST", &manifest);
+            module_manifests.push(manifest);
+        }
+        if output_mode != RustfmtOutputMode::Inherit {
+            command.stderr(std::process::Stdio::piped());
+        }
+
+        let command = command.spawn().map_err(|e| match e.kind() {
+            io::ErrorKind::NotFound => io::Error::new(
+                io::ErrorKind::Other,
+                "Could not run rustfmt, please make sure it is in your PATH.",
+            ),
+            _ => e,
+        })?;
+
+        let output = command.wait_with_output()?;
+        emitted_diagnostics |= !output.stderr.is_empty();
+        if !output.status.success() {
+            status = status.or_else(|| output.status.code());
+        }
     }
 
-    Ok(status
-        .iter()
-        .filter_map(|s| if s.success() { None } else { s.code() })
-        .next()
-        .unwrap_or(SUCCESS))
+    Ok(RustfmtOutput {
+        status: status.unwrap_or(SUCCESS),
+        emitted_diagnostics,
+        module_manifests,
+    })
 }
 
 fn get_cargo_metadata(manifest_path: Option<&Path>) -> Result<cargo_metadata::Metadata, io::Error> {
