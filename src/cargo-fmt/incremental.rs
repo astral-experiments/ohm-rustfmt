@@ -1860,11 +1860,15 @@ fn write_cache(path: &Path, snapshot: &Snapshot) -> io::Result<()> {
     fs::rename(temporary_path, path)
 }
 
-/// Conservatively disables caching for output-producing flags and unaudited inline settings.
+/// Conservatively disables caching for explicit file operands, output modes and unaudited settings.
 fn has_observable_emit_mode(arguments: &[String]) -> bool {
     let check_only = arguments.iter().any(|argument| argument == "--check");
     let mut arguments = arguments.iter();
     while let Some(argument) = arguments.next() {
+        if argument == "--" {
+            // Rustfmt must visit any named files, even if every Cargo target is unchanged.
+            return !arguments.as_slice().is_empty();
+        }
         if matches!(
             argument.as_str(),
             "--backup"
@@ -3663,6 +3667,12 @@ mod tests {
         assert!(second.is_directory);
         assert_ne!(first, second);
         Ok(())
+    }
+
+    #[test]
+    fn file_operands_after_the_option_terminator_require_full_formatting() {
+        assert!(has_observable_emit_mode(&["--".into(), "--check".into()]));
+        assert!(!has_observable_emit_mode(&["--check".into(), "--".into()]));
     }
 
     #[test]
