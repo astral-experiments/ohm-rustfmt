@@ -171,6 +171,7 @@ fn cargo_fmt_never_inherits_internal_module_handoffs() -> std::io::Result<()> {
             .env("OHM_RUSTFMT_MODULE_MANIFEST", &untrusted_manifest)
             .env("OHM_RUSTFMT_CHANGED_MODULE", &leaf)
             .env("OHM_RUSTFMT_MODULE_TOPOLOGY", &topology)
+            .env("OHM_RUSTFMT_ALLOW_MODULE_WRITE", "1")
             .output()?;
 
         assert_eq!(
@@ -490,6 +491,11 @@ fn cargo_fmt_verifies_only_rewritten_direct_leaves() -> std::io::Result<()> {
         let incremental = run("1")?;
         assert!(incremental.status.success());
         let trace = String::from_utf8_lossy(&incremental.stderr);
+        assert_eq!(
+            trace.contains("formatted one direct leaf with a pending write certificate"),
+            verify_leaves,
+            "{trace}",
+        );
         assert_eq!(
             trace.contains("verifying 1 rewritten direct leaves"),
             verify_leaves,

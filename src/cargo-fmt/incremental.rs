@@ -22,8 +22,10 @@ const MODULE_MANIFEST_SCHEMA: &str = "ohm.rustfmt-files";
 const MODULE_MANIFEST_ENVIRONMENT: &str = "OHM_RUSTFMT_MODULE_MANIFEST";
 const CHANGED_MODULE_ENVIRONMENT: &str = "OHM_RUSTFMT_CHANGED_MODULE";
 const MODULE_TOPOLOGY_ENVIRONMENT: &str = "OHM_RUSTFMT_MODULE_TOPOLOGY";
+const MODULE_WRITE_ENVIRONMENT: &str = "OHM_RUSTFMT_ALLOW_MODULE_WRITE";
 const LEAF_CERTIFICATE_SCHEMA: &str = "ohm.rustfmt-leaf";
 const LEAF_CERTIFICATE_VERSION: u32 = 3;
+const LEAF_WRITE_CERTIFICATE_VERSION: u32 = 4;
 const ENABLE_ENVIRONMENT: &str = "OHM_INCREMENTAL_FMT";
 const CACHE_ENVIRONMENT: &str = "OHM_INCREMENTAL_FMT_CACHE_DIR";
 const TRACE_ENVIRONMENT: &str = "OHM_INCREMENTAL_FMT_TRACE";
@@ -164,6 +166,13 @@ struct CertifiedLeaf {
     topology: String,
 }
 
+/// Separates an unchanged proof from a write that still needs read-only verification.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LeafCertificateKind {
+    Unchanged,
+    Rewritten,
+}
+
 /// Preserves the previously verified ownership of a uniquely changed direct child.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ChangedLeaf {
@@ -300,10 +309,14 @@ pub(super) fn format(
         return Ok(output.status);
     }
 
+    let leaf_certificate = changed_leaves.as_ref().and_then(|leaves| {
+        (!output.emitted_diagnostics)
+            .then(|| read_leaf_certificate(&output.module_manifests, leaves).ok())
+            .flatten()
+    });
+    let rewritten_leaf = leaf_certificate == Some(LeafCertificateKind::Rewritten);
     if let Some(leaves) = changed_leaves.as_ref() {
-        if !output.emitted_diagnostics
-            && read_leaf_certificate(&output.module_manifests, leaves).is_ok()
-        {
+        if leaf_certificate == Some(LeafCertificateKind::Unchanged) {
             match Snapshot::capture_from_snapshot(
                 Some(&plan.current),
                 targets,
@@ -335,27 +348,41 @@ pub(super) fn format(
         }
     }
 
-    let mut discovered = match read_module_manifests(&output.module_manifests, &changed_targets) {
-        Ok(discovered) => discovered,
-        Err(error) => {
-            if changed_leaves.is_some() {
+    let mut discovered = if rewritten_leaf {
+        trace("formatted one direct leaf with a pending write certificate");
+        // Reuse the cached graph only after validating that the requested leaf
+        // alone changed, a read-only pass proves v3, and the full snapshot is stable.
+        Discovery {
+            modules: ModuleGraph::new(),
+            leaves: LeafGraph::new(),
+            probes: ProbeGraph::new(),
+            unchanged: false,
+        }
+    } else {
+        match read_module_manifests(&output.module_manifests, &changed_targets) {
+            Ok(discovered) => discovered,
+            Err(error) => {
+                if changed_leaves.is_some() {
+                    trace(&format!(
+                        "reformatting the target without an authoritative leaf proof: {error}"
+                    ));
+                    return run_rustfmt(&changed_targets, arguments, verbosity);
+                }
                 trace(&format!(
-                    "reformatting the complete target without an authoritative leaf proof: {error}"
+                    "not caching without a complete authoritative module manifest: {error}"
                 ));
-                return run_rustfmt(&changed_targets, arguments, verbosity);
+                return Ok(output.status);
             }
-            trace(&format!(
-                "not caching without a complete authoritative module manifest: {error}"
-            ));
-            return Ok(output.status);
         }
     };
 
-    if discovers_new_shared_owner(
-        &plan.current.module_graph(),
-        &discovered.modules,
-        &changed_roots,
-    ) {
+    if !rewritten_leaf
+        && discovers_new_shared_owner(
+            &plan.current.module_graph(),
+            &discovered.modules,
+            &changed_roots,
+        )
+    {
         trace("reformatting all targets after discovering a new shared module owner");
         changed_targets = targets.clone();
         changed_roots = plan
@@ -405,9 +432,15 @@ pub(super) fn format(
     ) {
         Ok(updated)
             if plan.can_record(&updated, &changed_roots, check_only || unchanged)
-                && updated.probe_graph() == probes =>
+                && updated.probe_graph() == probes
+                && (!rewritten_leaf
+                    || plan.can_record_leaf_rewrite(
+                        &updated,
+                        &changed_roots,
+                        changed_leaves.as_deref().unwrap_or_default(),
+                    )) =>
         {
-            if check_only || unchanged {
+            if !rewritten_leaf && (check_only || unchanged) {
                 if check_only {
                     trace("caching a clean read-only formatter pass without reverification");
                 } else {
@@ -419,8 +452,11 @@ pub(super) fn format(
                 return Ok(output.status);
             }
 
-            let verification_leaves =
-                Plan::changed_leaves_between(&plan.current, &updated, &changed_roots);
+            let verification_leaves = if rewritten_leaf {
+                changed_leaves.clone()
+            } else {
+                Plan::changed_leaves_between(&plan.current, &updated, &changed_roots)
+            };
             let verification_modules = verification_leaves.as_ref().map(|leaves| {
                 leaves
                     .iter()
@@ -448,11 +484,16 @@ pub(super) fn format(
                 return Ok(output.status);
             }
             let certified_leaves = verification_leaves.as_ref().is_some_and(|leaves| {
-                read_leaf_certificate(&verification.module_manifests, leaves).is_ok()
+                read_leaf_certificate(&verification.module_manifests, leaves)
+                    .is_ok_and(|kind| kind == LeafCertificateKind::Unchanged)
             });
             if certified_leaves {
                 trace("verified rewritten direct leaves with authoritative certificates");
             } else {
+                if rewritten_leaf {
+                    trace("not caching without an unchanged leaf proof");
+                    return Ok(output.status);
+                }
                 let verification_discovery = match read_module_manifests(
                     &verification.module_manifests,
                     &changed_targets,
@@ -495,15 +536,28 @@ pub(super) fn format(
                 trace(&format!("could not update the formatting cache: {error}"));
             }
         }
-        Ok(_) => trace("not caching files changed concurrently with formatting"),
-        Err(error) => trace(&format!("could not verify formatted files: {error}")),
+        Ok(_) => {
+            trace("not caching files changed concurrently with formatting");
+            if rewritten_leaf {
+                return run_rustfmt(&changed_targets, arguments, verbosity);
+            }
+        }
+        Err(error) => {
+            trace(&format!("could not verify formatted files: {error}"));
+            if rewritten_leaf {
+                return run_rustfmt(&changed_targets, arguments, verbosity);
+            }
+        }
     }
 
     Ok(output.status)
 }
 
 /// Consumes only a regular, exact-root certificate published by the trusted formatter.
-fn read_leaf_certificate(paths: &[PathBuf], selected: &[ChangedLeaf]) -> io::Result<()> {
+fn read_leaf_certificate(
+    paths: &[PathBuf],
+    selected: &[ChangedLeaf],
+) -> io::Result<LeafCertificateKind> {
     let [path] = paths else {
         return Err(unsupported(
             "an incremental leaf needs exactly one certificate",
@@ -516,8 +570,16 @@ fn read_leaf_certificate(paths: &[PathBuf], selected: &[ChangedLeaf]) -> io::Res
     }
     let file = File::open(path)?;
     let certificate: LeafCertificate = serde_json::from_reader(file).map_err(io::Error::other)?;
+    let kind = match certificate.version {
+        LEAF_CERTIFICATE_VERSION => LeafCertificateKind::Unchanged,
+        LEAF_WRITE_CERTIFICATE_VERSION if selected.len() == 1 => LeafCertificateKind::Rewritten,
+        _ => {
+            return Err(unsupported(
+                "unsupported incremental leaf certificate version",
+            ));
+        }
+    };
     if certificate.schema != LEAF_CERTIFICATE_SCHEMA
-        || certificate.version != LEAF_CERTIFICATE_VERSION
         || selected.is_empty()
         || selected.iter().any(|leaf| leaf.root != certificate.root)
         || certificate.leaves.len() != selected.len()
@@ -538,7 +600,8 @@ fn read_leaf_certificate(paths: &[PathBuf], selected: &[ChangedLeaf]) -> io::Res
             "the incremental leaf certificate does not match its target",
         ));
     }
-    fs::remove_file(path)
+    fs::remove_file(path)?;
+    Ok(kind)
 }
 
 /// Accepts only the exact lowercase SHA-256 domain used by the trusted producer.
@@ -648,6 +711,7 @@ impl Plan {
         if env::var_os(MODULE_MANIFEST_ENVIRONMENT).is_some()
             || env::var_os(CHANGED_MODULE_ENVIRONMENT).is_some()
             || env::var_os(MODULE_TOPOLOGY_ENVIRONMENT).is_some()
+            || env::var_os(MODULE_WRITE_ENVIRONMENT).is_some()
         {
             return Err(unsupported(
                 "an external formatter handoff request cannot be cached safely",
@@ -830,6 +894,20 @@ impl Plan {
         }
         env::join_paths(changes.iter().map(|leaf| Path::new(&leaf.path))).ok()?;
         Some(changes)
+    }
+
+    /// Allows a pending leaf write to change only its originally selected source.
+    fn can_record_leaf_rewrite(
+        &self,
+        updated: &Snapshot,
+        changed_roots: &BTreeSet<&str>,
+        selected: &[ChangedLeaf],
+    ) -> bool {
+        selected.len() == 1
+            && self.can_record(updated, changed_roots, false)
+            && (updated == &self.current
+                || Self::changed_leaves_between(&self.current, updated, changed_roots)
+                    .is_some_and(|changes| changes.iter().all(|leaf| selected.contains(leaf))))
     }
 
     /// Rejects concurrent source/configuration changes while allowing newly discovered configs.
@@ -2046,6 +2124,182 @@ mod tests {
         let plan = plan(Some(current.clone()), current);
 
         assert!(plan.changed_targets().is_empty());
+    }
+
+    #[test]
+    fn write_certificates_are_distinct_from_unchanged_and_reject_batches() -> io::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let root = directory.path().join("lib.rs");
+        let first = directory.path().join("first.rs");
+        let second = directory.path().join("second.rs");
+        for path in [&root, &first, &second] {
+            fs::write(path, "")?;
+        }
+        let root = path_string(&root.canonicalize()?)?;
+        let selected = [first, second]
+            .into_iter()
+            .map(|path| {
+                Ok(ChangedLeaf {
+                    root: root.clone(),
+                    path: path_string(&path.canonicalize()?)?,
+                    topology: format!("{:064x}", 1),
+                })
+            })
+            .collect::<io::Result<Vec<_>>>()?;
+        let path = directory.path().join("certificate.json");
+        for (version, count, expected) in [
+            (3, 1, Some(LeafCertificateKind::Unchanged)),
+            (4, 1, Some(LeafCertificateKind::Rewritten)),
+            (4, 2, None),
+            (5, 1, None),
+        ] {
+            let certificate = LeafCertificate {
+                schema: LEAF_CERTIFICATE_SCHEMA.to_owned(),
+                version,
+                root: root.clone(),
+                leaves: selected[..count]
+                    .iter()
+                    .map(|leaf| CertifiedLeaf {
+                        leaf: leaf.path.clone(),
+                        topology: leaf.topology.clone(),
+                    })
+                    .collect(),
+            };
+            fs::write(&path, serde_json::to_vec(&certificate)?)?;
+            assert_eq!(
+                read_leaf_certificate(std::slice::from_ref(&path), &selected[..count]).ok(),
+                expected
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn pending_leaf_writes_reject_every_unselected_input_change() {
+        let package = "/workspace/first";
+        let root = "/workspace/first/src/lib.rs";
+        let leaf = "/workspace/first/src/child.rs";
+        let mut current = snapshot(&[
+            (
+                package,
+                &[
+                    ("src/lib.rs", "root"),
+                    ("src/child.rs", "before"),
+                    ("src/sibling.rs", "sibling"),
+                ],
+            ),
+            ("/workspace/second", &[("src/lib.rs", "other")]),
+        ]);
+        authorize_leaf(&mut current, package, leaf);
+        let plan = plan(None, current.clone());
+        let selected = [ChangedLeaf {
+            root: root.to_owned(),
+            path: leaf.to_owned(),
+            topology: format!("{:064x}", 1),
+        }];
+        let roots = BTreeSet::from([root]);
+        let mut rewritten = current.clone();
+        rewritten
+            .packages
+            .get_mut(package)
+            .unwrap()
+            .targets
+            .get_mut(root)
+            .unwrap()
+            .insert(leaf.to_owned(), fingerprint("formatted"));
+        assert!(plan.can_record_leaf_rewrite(&rewritten, &roots, &selected));
+        assert!(plan.can_record_leaf_rewrite(&current, &roots, &selected));
+
+        for change in [
+            "root",
+            "sibling",
+            "other",
+            "config",
+            "probe",
+            "topology",
+            "owner",
+            "invocation",
+        ] {
+            let mut concurrent = rewritten.clone();
+            match change {
+                "root" | "sibling" => {
+                    let path = if change == "root" {
+                        root
+                    } else {
+                        "/workspace/first/src/sibling.rs"
+                    };
+                    concurrent
+                        .packages
+                        .get_mut(package)
+                        .unwrap()
+                        .targets
+                        .get_mut(root)
+                        .unwrap()
+                        .insert(path.to_owned(), fingerprint("concurrent"));
+                }
+                "other" => {
+                    concurrent
+                        .packages
+                        .get_mut("/workspace/second")
+                        .unwrap()
+                        .targets
+                        .get_mut("/workspace/second/src/lib.rs")
+                        .unwrap()
+                        .insert(
+                            "/workspace/second/src/lib.rs".to_owned(),
+                            fingerprint("concurrent"),
+                        );
+                }
+                "config" => {
+                    concurrent
+                        .configuration
+                        .insert("/new/rustfmt.toml".to_owned(), "new".to_owned());
+                }
+                "probe" => {
+                    concurrent
+                        .packages
+                        .get_mut(package)
+                        .unwrap()
+                        .probes
+                        .get_mut(root)
+                        .unwrap()
+                        .insert(
+                            "/new/module.rs".to_owned(),
+                            ProbeObservation {
+                                canonical: None,
+                                exists: false,
+                                is_directory: false,
+                            },
+                        );
+                }
+                "topology" => {
+                    concurrent
+                        .packages
+                        .get_mut(package)
+                        .unwrap()
+                        .leaves
+                        .get_mut(root)
+                        .unwrap()
+                        .insert(leaf.to_owned(), format!("{:064x}", 2));
+                }
+                "owner" => {
+                    concurrent
+                        .packages
+                        .get_mut("/workspace/second")
+                        .unwrap()
+                        .targets
+                        .get_mut("/workspace/second/src/lib.rs")
+                        .unwrap()
+                        .insert(leaf.to_owned(), fingerprint("formatted"));
+                }
+                "invocation" => concurrent.invocation.push_str("-changed"),
+                _ => unreachable!(),
+            }
+            assert!(
+                !plan.can_record_leaf_rewrite(&concurrent, &roots, &selected),
+                "{change}"
+            );
+        }
     }
 
     #[test]
