@@ -63,6 +63,12 @@ jobs:
         env:
           RUSTFLAGS: -D warnings
         run: cargo run --locked --manifest-path ci/Cargo.toml build-and-test
+      - name: Check dev-channel formatting fixtures
+        if: runner.os == 'Linux' && matrix.release-channel == 'stable'
+        env:
+          CFG_RELEASE_CHANNEL: dev
+          RUSTFLAGS: -D warnings
+        run: cargo test --locked --lib test::system_tests -- --exact
 
   rustdoc:
     name: Rustdoc
