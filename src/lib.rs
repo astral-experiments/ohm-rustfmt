@@ -447,7 +447,7 @@ pub struct Session<'b, T: Write> {
     source_file: SourceFile,
     emitter: Box<dyn Emitter + 'b>,
     module_graph: Option<ResolvedModuleGraph>,
-    unchanged_leaf: Option<(PathBuf, PathBuf, String)>,
+    unchanged_leaves: BTreeSet<(PathBuf, PathBuf, String)>,
     emitted_diagnostics: bool,
 }
 
@@ -489,6 +489,11 @@ struct LeafFormatCertificate<'a> {
     schema: &'static str,
     version: u32,
     root: &'a Path,
+    leaves: Vec<CertifiedModule<'a>>,
+}
+
+#[derive(serde::Serialize)]
+struct CertifiedModule<'a> {
     leaf: &'a Path,
     topology: &'a str,
 }
@@ -523,7 +528,7 @@ impl<'b, T: Write + 'b> Session<'b, T> {
             errors: ReportedErrors::default(),
             source_file: SourceFile::new(),
             module_graph: None,
-            unchanged_leaf: None,
+            unchanged_leaves: BTreeSet::new(),
             emitted_diagnostics: false,
         }
     }
@@ -531,7 +536,7 @@ impl<'b, T: Write + 'b> Session<'b, T> {
     /// The main entry point for Rustfmt. Formats the given input according to the
     /// given config. `out` is only necessary if required by the configuration.
     pub fn format(&mut self, input: Input) -> Result<FormatReport, ErrorKind> {
-        self.unchanged_leaf = None;
+        self.unchanged_leaves.clear();
         self.format_input_inner(input, false)
     }
 
@@ -553,7 +558,15 @@ impl<'b, T: Write + 'b> Session<'b, T> {
         module: &Path,
         expected_topology: &str,
     ) -> Result<Option<FormatReport>, ErrorKind> {
-        self.unchanged_leaf = None;
+        match root.canonicalize().ok().zip(module.canonicalize().ok()) {
+            Some((root, module)) => {
+                self.unchanged_leaves
+                    .retain(|(previous_root, previous_module, _)| {
+                        previous_root != &root || previous_module != &module
+                    })
+            }
+            None => self.unchanged_leaves.clear(),
+        }
         let original = fs::read(module).ok();
         let report = self.format_leaf_input(root, module, Some(expected_topology))?;
         if report
@@ -569,12 +582,15 @@ impl<'b, T: Write + 'b> Session<'b, T> {
             && original
                 .is_some_and(|original| fs::read(module).is_ok_and(|result| result == original))
         {
-            self.unchanged_leaf = root
+            if let Some(unchanged) = root
                 .canonicalize()
                 .ok()
                 .zip(module.canonicalize().ok())
                 .zip(report.as_ref().map(|(_, topology, _)| topology.clone()))
-                .map(|((root, module), topology)| (root, module, topology));
+                .map(|((root, module), topology)| (root, module, topology))
+            {
+                self.unchanged_leaves.insert(unchanged);
+            }
         }
         Ok(report.map(|(report, _, _)| report))
     }
@@ -742,29 +758,52 @@ impl<'b, T: Write + 'b> Session<'b, T> {
         leaf: &Path,
         topology: &str,
     ) -> io::Result<()> {
-        if !self.has_no_visible_errors() {
+        self.write_leaf_certificates(path, root, &[(leaf.to_owned(), String::from(topology))])
+    }
+
+    /// Publishes proof only for previously certified, distinct leaves of the exact root.
+    #[doc(hidden)]
+    pub fn write_leaf_certificates(
+        &self,
+        path: &Path,
+        root: &Path,
+        leaves: &[(PathBuf, String)],
+    ) -> io::Result<()> {
+        if self.emitted_diagnostics || !self.has_no_visible_errors() {
             return Err(io::Error::other(
                 "the incremental leaf format was not clean",
             ));
         }
         let root = root.canonicalize()?;
-        let leaf = leaf.canonicalize()?;
-        if root == leaf
-            || self.unchanged_leaf.as_ref()
-                != Some(&(root.clone(), leaf.clone(), String::from(topology)))
-        {
-            return Err(io::Error::other(
-                "the incremental leaf was not proven unchanged",
-            ));
+        let mut canonical = Vec::with_capacity(leaves.len());
+        let mut unique = BTreeSet::new();
+        for (leaf, topology) in leaves {
+            let leaf = leaf.canonicalize()?;
+            if root == leaf
+                || !unique.insert(leaf.clone())
+                || !self
+                    .unchanged_leaves
+                    .contains(&(root.clone(), leaf.clone(), topology.clone()))
+            {
+                return Err(io::Error::other(
+                    "the incremental leaf was not proven unchanged",
+                ));
+            }
+            canonical.push((leaf, topology));
+        }
+        if canonical.is_empty() {
+            return Err(io::Error::other("the incremental leaf batch is empty"));
         }
         write_authoritative_manifest(
             path,
             &LeafFormatCertificate {
                 schema: "ohm.rustfmt-leaf",
-                version: 2,
+                version: 3,
                 root: &root,
-                leaf: &leaf,
-                topology,
+                leaves: canonical
+                    .iter()
+                    .map(|(leaf, topology)| CertifiedModule { leaf, topology })
+                    .collect(),
             },
         )
     }
@@ -1140,6 +1179,88 @@ mod unit_tests {
         let certificate: serde_json::Value =
             serde_json::from_slice(&fs::read(certificate)?).map_err(io::Error::other)?;
         assert_eq!(certificate["schema"], "ohm.rustfmt-leaf");
+        Ok(())
+    }
+
+    #[test]
+    fn multiple_certified_leaves_require_independent_proofs() -> io::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let root = directory.path().join("lib.rs");
+        let first = directory.path().join("first.rs");
+        let second = directory.path().join("second.rs");
+        fs::write(&root, "mod first;\nmod second;\n")?;
+        fs::write(&first, "fn first() {}\n")?;
+        fs::write(&second, "fn second() {}\n")?;
+
+        let mut output = Vec::new();
+        let mut session = Session::new(Config::default(), Some(&mut output));
+        for leaf in [&first, &second] {
+            assert!(
+                session
+                    .format_leaf(&root, leaf)
+                    .map_err(io::Error::other)?
+                    .is_some()
+            );
+        }
+        let topology = modules::empty_module_topology();
+        let leaves = vec![
+            (first.clone(), topology.clone()),
+            (second.clone(), topology.clone()),
+        ];
+        let certificate_path = directory.path().join("leaves.json");
+        session.write_leaf_certificates(&certificate_path, &root, &leaves)?;
+        let certificate: serde_json::Value =
+            serde_json::from_slice(&fs::read(&certificate_path)?).map_err(io::Error::other)?;
+        assert_eq!(certificate["version"], 3);
+        assert_eq!(certificate["leaves"].as_array().map(Vec::len), Some(2));
+
+        let duplicate = vec![(first.clone(), topology.clone()), (first, topology)];
+        assert!(
+            session
+                .write_leaf_certificates(
+                    &directory.path().join("duplicate.json"),
+                    &root,
+                    &duplicate
+                )
+                .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn rechecking_a_changed_leaf_invalidates_its_previous_certificate() -> io::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let root = directory.path().join("lib.rs");
+        let leaf = directory.path().join("child.rs");
+        fs::write(&root, "mod child;\n")?;
+        fs::write(&leaf, "fn child() {}\n")?;
+
+        let mut output = Vec::new();
+        let mut session = Session::new(Config::default(), Some(&mut output));
+        assert!(
+            session
+                .format_leaf(&root, &leaf)
+                .map_err(io::Error::other)?
+                .is_some()
+        );
+
+        fs::write(&leaf, "fn child( ){ }\n")?;
+        assert!(
+            session
+                .format_leaf(&root, &leaf)
+                .map_err(io::Error::other)?
+                .is_none()
+        );
+        assert!(
+            session
+                .write_leaf_certificate(
+                    &directory.path().join("stale.json"),
+                    &root,
+                    &leaf,
+                    &modules::empty_module_topology(),
+                )
+                .is_err()
+        );
         Ok(())
     }
 
