@@ -64,7 +64,7 @@ unicode-properties = { version = "0.1", default-features = false, features = ["g
 rustfmt-config_proc_macro = { version = "0.3", path = "config_proc_macro" }
 semver = "1.0.21"
 
-[target.'cfg(target_os = "linux")'.dependencies]
+[target.'cfg(unix)'.dependencies]
 rustix = { version = "1.1.2", features = ["fs"] }
 
 # Rustc dependencies are loaded from the sysroot, Cargo doesn't know about them.
