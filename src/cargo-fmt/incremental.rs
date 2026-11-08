@@ -3,6 +3,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
@@ -723,11 +725,7 @@ impl Plan {
         let invocation = invocation_key(targets, arguments)?;
         let directory = cache_directory(manifest_path)?;
         let cache_path = directory.join(format!("{invocation}.json"));
-        let previous: Option<Snapshot> = match fs::read(&cache_path) {
-            Ok(contents) => serde_json::from_slice(&contents).ok(),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
-            Err(error) => return Err(error),
-        };
+        let previous = read_cache(&cache_path)?;
         let mut previous = previous.filter(|snapshot| {
             snapshot.version == CACHE_VERSION && snapshot.invocation == invocation
         });
@@ -1928,6 +1926,25 @@ fn cache_directory(manifest_path: Option<&Path>) -> io::Result<PathBuf> {
     Ok(directory.join("target").join("ohm-rustfmt"))
 }
 
+fn read_cache(path: &Path) -> io::Result<Option<Snapshot>> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    // Opening a FIFO must not wait for a writer while we hold the cache lock.
+    #[cfg(unix)]
+    options.custom_flags(rustix::fs::OFlags::NONBLOCK.bits() as i32);
+    let mut file = match options.open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    if !file.metadata()?.is_file() {
+        return Ok(None);
+    }
+    let mut contents = Vec::new();
+    file.read_to_end(&mut contents)?;
+    Ok(serde_json::from_slice(&contents).ok())
+}
+
 /// Publishes a fully serialized snapshot with an atomic same-directory rename.
 fn write_cache(path: &Path, snapshot: &Snapshot) -> io::Result<()> {
     let Some(parent) = path.parent() else {
@@ -2086,6 +2103,29 @@ mod tests {
                 })
                 .collect(),
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reading_a_snapshot_does_not_wait_for_a_fifo_writer() -> io::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let fifo = directory.path().join("snapshot.json");
+        assert!(
+            std::process::Command::new("mkfifo")
+                .arg(&fifo)
+                .status()?
+                .success()
+        );
+
+        let (send, receive) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = send.send(read_cache(&fifo));
+        });
+        let snapshot = receive
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("reading the snapshot blocked without a FIFO writer")?;
+        assert!(snapshot.is_none());
+        Ok(())
     }
 
     #[test]
