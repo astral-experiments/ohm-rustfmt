@@ -612,6 +612,8 @@ dependencies = [
  "unicode-properties",
  "unicode-segmentation",
  "unicode-width 0.1.14",
+ "winapi-util",
+ "windows-sys",
 ]
 
 [[package]]
