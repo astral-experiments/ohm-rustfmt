@@ -620,12 +620,46 @@ fn valid_topology_digest(digest: &str) -> bool {
 fn lock_cache(manifest_path: Option<&Path>) -> io::Result<File> {
     let directory = cache_directory(manifest_path)?;
     fs::create_dir_all(&directory)?;
-    let lock = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(directory.join(".lock"))?;
+    lock_cache_file(&directory.join(".lock"))
+}
+
+/// Acquires the cache's own regular lock file without following a link to another inode.
+fn lock_cache_file(path: &Path) -> io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    options
+        .custom_flags((rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::NONBLOCK).bits() as i32);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
+
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    #[cfg(not(any(unix, windows)))]
+    if path.is_symlink() {
+        return Err(unsupported("the formatter cache lock is a symbolic link"));
+    }
+
+    let lock = options.open(path)?;
+    let metadata = lock.metadata()?;
+    if !metadata.is_file() {
+        return Err(unsupported(
+            "the formatter cache lock is not a regular file",
+        ));
+    }
+    #[cfg(unix)]
+    let links = std::os::unix::fs::MetadataExt::nlink(&metadata);
+    #[cfg(windows)]
+    let links = winapi_util::file::information(&lock)?.number_of_links();
+    #[cfg(any(unix, windows))]
+    if links != 1 {
+        return Err(unsupported(
+            "the formatter cache lock has extra or missing links",
+        ));
+    }
+
     lock.lock()?;
     Ok(lock)
 }
@@ -2139,6 +2173,22 @@ mod tests {
         write_cache(&path, &cached)?;
         assert!(read_cache(&path, &cached.invocation)?.is_none());
         Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_linked_cache_locks() {
+        let directory = tempfile::tempdir().unwrap();
+        let lock = directory.path().join(".lock");
+        let unrelated = directory.path().join("unrelated");
+        std::os::unix::fs::symlink(&unrelated, &lock).unwrap();
+        assert!(lock_cache_file(&lock).is_err());
+        assert!(!unrelated.exists());
+
+        fs::remove_file(&lock).unwrap();
+        fs::write(&unrelated, "shared data").unwrap();
+        fs::hard_link(&unrelated, &lock).unwrap();
+        assert!(lock_cache_file(&lock).is_err());
     }
 
     #[cfg(unix)]
