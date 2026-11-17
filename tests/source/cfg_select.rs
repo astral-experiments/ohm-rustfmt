@@ -1,4 +1,4 @@
-// rustfmt-unstable: true
+// rustfmt-channels: nightly
 // rustfmt-style_edition: 2024
 // rustfmt-skip_children: true
 

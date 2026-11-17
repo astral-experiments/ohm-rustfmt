@@ -801,11 +801,14 @@ fn check_files(files: Vec<PathBuf>, opt_config: &Option<PathBuf>) -> (Vec<Format
         }
 
         if sig_comments.contains_key("stable") && is_nightly_channel!() {
-            debug!(
-                "Skipping '{}' because nightly introduces formatting changes. \
-                 Formatting should be stable on the `stable` channel.",
-                file_name.display()
-            );
+            continue;
+        }
+        let channel = option_env!("CFG_RELEASE_CHANNEL").unwrap_or("nightly");
+        if sig_comments
+            .get("channels")
+            .is_some_and(|channels| channels.split(',').all(|allowed| allowed != channel))
+        {
+            debug!("Skipping {} on {channel}", file_name.display());
             continue;
         }
 
@@ -879,7 +882,10 @@ fn read_config(filename: &Path) -> Config {
     };
 
     for (key, val) in &sig_comments {
-        if key != "target" && key != "config" && key != "unstable" && key != "stable" {
+        if !matches!(
+            key.as_str(),
+            "target" | "config" | "unstable" | "stable" | "channels"
+        ) {
             config.override_value(key, val);
         }
     }

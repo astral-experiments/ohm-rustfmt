@@ -1,10 +1,17 @@
-// rustfmt-stable: true
+// rustfmt-channels: stable,beta,dev
 
-// While we gate the `cfg_select!` formatting behind the `is_nightly_channel!()` check
-// this test helps ensure that we don't start formatting `cfg_select!` on the `stable`
-// or `beta` release channels. It is intentionally formatted incorrectly. As soon as the
-// `is_nightly_channel!()` gate is removed this will start formatting and we can remove this test.
+// Stable formatting preserves the tokens inside these invocations.
 cfg_select! (
        unix     => 1,
        windows     => 1,
 );
+
+fn platform_value() -> u8 {
+    cfg_select! {
+        unix => {
+            let value = 1;
+            value
+        },
+        _ => 2,
+    }
+}
