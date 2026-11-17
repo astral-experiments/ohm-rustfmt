@@ -443,6 +443,17 @@ fn cargo_fmt_caches_clean_checks_without_a_second_formatter_pass() -> std::io::R
         );
         assert!(!error.contains("cache hit"), "{error}");
     }
+
+    fs::write(
+        package.join("rustfmt.toml"),
+        "unknown_formatter_key = true\n",
+    )?;
+    for output in [run()?, format()?, run()?] {
+        assert!(output.status.success());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let warning = "Unknown configuration option `unknown_formatter_key`";
+        assert_eq!(stderr.matches(warning).count(), 1, "{stderr}");
+    }
     Ok(())
 }
 
