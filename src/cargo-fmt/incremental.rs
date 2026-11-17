@@ -1228,8 +1228,11 @@ fn invocation_key(targets: &BTreeSet<Target>, arguments: &[String]) -> io::Resul
 
 /// Shares successful read/write proofs without conflating any effective formatting options.
 fn hash_formatter_arguments(invocation: &mut Sha256, arguments: &[String]) {
+    let mut skipped_check = false;
     for argument in arguments {
-        if argument != "--check" {
+        if argument == "--check" && !skipped_check {
+            skipped_check = true;
+        } else {
             hash_value(invocation, argument);
         }
     }
@@ -3794,6 +3797,7 @@ mod tests {
         };
 
         assert_eq!(identity(&[]), identity(&["--check"]));
+        assert_ne!(identity(&["--check"]), identity(&["--check", "--check"]));
         assert_eq!(
             identity(&["--config", "imports_granularity=Item"]),
             identity(&["--config", "imports_granularity=Item", "--check"]),
