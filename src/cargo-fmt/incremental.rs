@@ -725,10 +725,7 @@ impl Plan {
         let invocation = invocation_key(targets, arguments)?;
         let directory = cache_directory(manifest_path)?;
         let cache_path = directory.join(format!("{invocation}.json"));
-        let previous = read_cache(&cache_path)?;
-        let mut previous = previous.filter(|snapshot| {
-            snapshot.version == CACHE_VERSION && snapshot.invocation == invocation
-        });
+        let mut previous = read_cache(&cache_path, &invocation)?;
         let current = match Snapshot::capture_from_snapshot(
             previous.as_ref(),
             targets,
@@ -1926,7 +1923,13 @@ fn cache_directory(manifest_path: Option<&Path>) -> io::Result<PathBuf> {
     Ok(directory.join("target").join("ohm-rustfmt"))
 }
 
-fn read_cache(path: &Path) -> io::Result<Option<Snapshot>> {
+fn read_cache(path: &Path, invocation: &str) -> io::Result<Option<Snapshot>> {
+    #[derive(Deserialize)]
+    struct SnapshotHeader {
+        version: u32,
+        invocation: String,
+    }
+
     let mut options = OpenOptions::new();
     options.read(true);
     // Opening a FIFO must not wait for a writer while we hold the cache lock.
@@ -1942,6 +1945,17 @@ fn read_cache(path: &Path) -> io::Result<Option<Snapshot>> {
     }
     let mut contents = Vec::new();
     file.read_to_end(&mut contents)?;
+    // The writer emits the version and hex invocation first. Avoid a second JSON pass
+    // on warm hits, and check other encodings without allocating their package maps.
+    let prefix = format!(r#"{{"version":{CACHE_VERSION},"invocation":"{invocation}","#);
+    if !contents.starts_with(prefix.as_bytes()) {
+        let Ok(header) = serde_json::from_slice::<SnapshotHeader>(&contents) else {
+            return Ok(None);
+        };
+        if header.version != CACHE_VERSION || header.invocation != invocation {
+            return Ok(None);
+        }
+    }
     Ok(serde_json::from_slice(&contents).ok())
 }
 
@@ -2105,6 +2119,28 @@ mod tests {
         }
     }
 
+    #[test]
+    fn reads_only_snapshots_for_the_current_version_and_invocation() -> io::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("snapshot.json");
+        let mut cached = snapshot(&[]);
+        write_cache(&path, &cached)?;
+        assert_eq!(
+            read_cache(&path, &cached.invocation)?.as_ref(),
+            Some(&cached)
+        );
+        fs::write(&path, serde_json::to_vec_pretty(&cached)?)?;
+        assert_eq!(
+            read_cache(&path, &cached.invocation)?.as_ref(),
+            Some(&cached)
+        );
+        assert!(read_cache(&path, "different invocation")?.is_none());
+        cached.version -= 1;
+        write_cache(&path, &cached)?;
+        assert!(read_cache(&path, &cached.invocation)?.is_none());
+        Ok(())
+    }
+
     #[cfg(unix)]
     #[test]
     fn reading_a_snapshot_does_not_wait_for_a_fifo_writer() -> io::Result<()> {
@@ -2119,7 +2155,7 @@ mod tests {
 
         let (send, receive) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            let _ = send.send(read_cache(&fifo));
+            let _ = send.send(read_cache(&fifo, "test"));
         });
         let snapshot = receive
             .recv_timeout(std::time::Duration::from_secs(5))
