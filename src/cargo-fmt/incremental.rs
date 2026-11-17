@@ -2,7 +2,7 @@ use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
@@ -1935,10 +1935,12 @@ fn write_cache(path: &Path, snapshot: &Snapshot) -> io::Result<()> {
     };
 
     fs::create_dir_all(parent)?;
-    let temporary_path = path.with_extension(format!("{}.tmp", std::process::id()));
     let contents = serde_json::to_vec(snapshot).map_err(io::Error::other)?;
-    fs::write(&temporary_path, contents)?;
-    fs::rename(temporary_path, path)
+    // Preserve normal cache-file permissions while exclusively creating the staging file.
+    let mut temporary = tempfile::Builder::new().make_in(parent, |path| File::create_new(path))?;
+    temporary.write_all(&contents)?;
+    temporary.persist(path)?;
+    Ok(())
 }
 
 /// Conservatively disables caching for explicit file operands, output modes and unaudited settings.
@@ -2084,6 +2086,27 @@ mod tests {
                 })
                 .collect(),
         }
+    }
+
+    #[test]
+    fn publishing_a_snapshot_preserves_an_existing_temporary_file() -> io::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let cache = directory.path().join("snapshot.json");
+        let source = directory.path().join("source.rs");
+        fs::write(&source, b"fn main() {}\n")?;
+        fs::hard_link(
+            &source,
+            cache.with_extension(format!("{}.tmp", std::process::id())),
+        )?;
+
+        let expected = snapshot(&[]);
+        write_cache(&cache, &expected)?;
+        assert_eq!(fs::read(&source)?, b"fn main() {}\n");
+        assert_eq!(
+            serde_json::from_slice::<Snapshot>(&fs::read(cache)?)?,
+            expected
+        );
+        Ok(())
     }
 
     fn plan(previous: Option<Snapshot>, current: Snapshot) -> Plan {
