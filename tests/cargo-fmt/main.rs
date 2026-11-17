@@ -262,6 +262,42 @@ fn cargo_fmt_logging_preserves_root_and_sibling_events_after_a_leaf_edit() -> st
 }
 
 #[cfg(unix)]
+#[test]
+fn fallback_formatter_can_lock_the_cache() -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    if let Some(path) = env::var_os("OHM_TEST_FALLBACK_LOCK") {
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)?;
+        return file.try_lock().map_err(std::io::Error::other);
+    }
+
+    let directory = tempfile::tempdir()?;
+    let hook = directory.path().join("rustfmt-hook");
+    fs::write(
+        &hook,
+        "#!/bin/sh\nexec \"$OHM_TEST_HARNESS\" --exact fallback_formatter_can_lock_the_cache\n",
+    )?;
+    fs::set_permissions(&hook, fs::Permissions::from_mode(0o755))?;
+    let output = cargo_fmt_command()
+        .args([
+            "--check",
+            "--manifest-path",
+            "tests/cargo-fmt/source/issue_3164/Cargo.toml",
+        ])
+        .env("RUSTFMT", hook)
+        .env("OHM_INCREMENTAL_FMT", "1")
+        .env("OHM_INCREMENTAL_FMT_CACHE_DIR", directory.path())
+        .env("OHM_TEST_HARNESS", env::current_exe()?)
+        .env("OHM_TEST_FALLBACK_LOCK", directory.path().join(".lock"))
+        .output()?;
+    assert!(output.status.success(), "{output:?}");
+    Ok(())
+}
+
+#[cfg(unix)]
 fn trusted_formatter_tools(
     package: &Path,
 ) -> std::io::Result<(std::path::PathBuf, std::path::PathBuf)> {
