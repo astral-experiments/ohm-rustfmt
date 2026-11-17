@@ -9,7 +9,7 @@ use std::time::UNIX_EPOCH;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::path_utils::canonicalize;
+use crate::path_utils::{canonicalize, canonicalize_with_handle};
 
 use super::{
     RustfmtOutput, RustfmtOutputMode, SUCCESS, Target, Verbosity, run_rustfmt,
@@ -569,7 +569,8 @@ fn read_leaf_certificate(
         ));
     }
     let file = File::open(path)?;
-    let certificate: LeafCertificate = serde_json::from_reader(file).map_err(io::Error::other)?;
+    let certificate: LeafCertificate =
+        serde_json::from_reader(io::BufReader::new(file)).map_err(io::Error::other)?;
     let kind = match certificate.version {
         LEAF_CERTIFICATE_VERSION => LeafCertificateKind::Unchanged,
         LEAF_WRITE_CERTIFICATE_VERSION if selected.len() == 1 => LeafCertificateKind::Rewritten,
@@ -1388,8 +1389,11 @@ fn canonical_module_file(path: &str) -> io::Result<(PathBuf, fs::Metadata)> {
     if !path.is_absolute() {
         return Err(unsupported("an authoritative module path is not absolute"));
     }
-    let canonical = canonicalize(path)?;
-    let metadata = fs::metadata(&canonical)?;
+    let (canonical, handle) = canonicalize_with_handle(path)?;
+    let metadata = match handle {
+        Some(handle) => handle.metadata()?,
+        None => fs::metadata(&canonical)?,
+    };
     if canonical != path || !metadata.is_file() {
         return Err(unsupported(
             "an authoritative module path is not a canonical source file",
