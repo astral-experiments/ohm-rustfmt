@@ -448,6 +448,7 @@ pub struct Session<'b, T: Write> {
     emitter: Box<dyn Emitter + 'b>,
     module_graph: Option<ResolvedModuleGraph>,
     unchanged_leaves: BTreeSet<(PathBuf, PathBuf, String)>,
+    rewritten_sources: bool,
     emitted_diagnostics: bool,
 }
 
@@ -471,6 +472,7 @@ struct ResolvedRootFiles {
 struct ModuleGraphManifest<'a> {
     schema: &'static str,
     version: u32,
+    unchanged: bool,
     roots: Vec<ModuleGraphRoot<'a>>,
 }
 
@@ -529,6 +531,7 @@ impl<'b, T: Write + 'b> Session<'b, T> {
             source_file: SourceFile::new(),
             module_graph: None,
             unchanged_leaves: BTreeSet::new(),
+            rewritten_sources: false,
             emitted_diagnostics: false,
         }
     }
@@ -730,6 +733,7 @@ impl<'b, T: Write + 'b> Session<'b, T> {
         let manifest = ModuleGraphManifest {
             schema: "ohm.rustfmt-files",
             version: 3,
+            unchanged: !self.rewritten_sources,
             roots: graph
                 .roots
                 .iter()
@@ -1034,6 +1038,7 @@ mod unit_tests {
 
         assert_eq!(manifest["schema"], "ohm.rustfmt-files");
         assert_eq!(manifest["version"], 3);
+        assert_eq!(manifest["unchanged"], true);
         assert_eq!(
             manifest["roots"][0]["path"],
             first_root.canonicalize()?.to_string_lossy().as_ref()
@@ -1100,6 +1105,7 @@ mod unit_tests {
         session.write_module_manifest(&manifest_path, &[root])?;
         let manifest: serde_json::Value =
             serde_json::from_slice(&fs::read(manifest_path)?).map_err(io::Error::other)?;
+        assert_eq!(manifest["unchanged"], false);
         let files = manifest["roots"][0]["files"]
             .as_array()
             .ok_or_else(|| io::Error::other("module files missing"))?;
