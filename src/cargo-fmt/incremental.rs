@@ -306,16 +306,11 @@ pub(super) fn format(
         if !output.emitted_diagnostics
             && read_leaf_certificate(&output.module_manifests, leaves).is_ok()
         {
-            let modules = plan.current.module_graph();
-            let leaf_graph = plan.current.leaf_graph();
-            let probes = plan.current.probe_graph();
-            match Snapshot::capture(
+            match Snapshot::capture_from_snapshot(
+                Some(&plan.current),
                 targets,
                 arguments,
                 manifest_path,
-                &modules,
-                &leaf_graph,
-                &probes,
                 None,
             ) {
                 Ok(updated) if updated == plan.current => {
@@ -644,38 +639,22 @@ impl Plan {
         let mut previous = previous.filter(|snapshot| {
             snapshot.version == CACHE_VERSION && snapshot.invocation == invocation
         });
-        let modules = previous
-            .as_ref()
-            .map(Snapshot::module_graph)
-            .unwrap_or_default();
-        let probes = previous
-            .as_ref()
-            .map(Snapshot::probe_graph)
-            .unwrap_or_default();
-        let leaves = previous
-            .as_ref()
-            .map(Snapshot::leaf_graph)
-            .unwrap_or_default();
-        let current = match Snapshot::capture(
+        let current = match Snapshot::capture_from_snapshot(
+            previous.as_ref(),
             targets,
             arguments,
             manifest_path,
-            &modules,
-            &leaves,
-            &probes,
             Some(&invocation),
         ) {
             Ok(current) => current,
             Err(_) if previous.is_some() => {
                 trace("rediscovering an unavailable cached module graph");
                 previous = None;
-                Snapshot::capture(
+                Snapshot::capture_from_snapshot(
+                    None,
                     targets,
                     arguments,
                     manifest_path,
-                    &ModuleGraph::new(),
-                    &LeafGraph::new(),
-                    &ProbeGraph::new(),
                     Some(&invocation),
                 )?
             }
@@ -873,8 +852,41 @@ impl Plan {
     }
 }
 
+/// Borrows one target's source ownership and resolution data during a fresh observation.
+struct TargetGraph<'a, Paths> {
+    paths: Option<Paths>,
+    leaves: Option<&'a BTreeMap<String, String>>,
+    probes: Option<&'a BTreeMap<String, ProbeObservation>>,
+}
+
 impl Snapshot {
-    /// Observes authoritative sources once each and discovers all effective formatter settings.
+    /// Replays cached ownership without copying its source, leaf, and probe graphs.
+    fn capture_from_snapshot(
+        previous: Option<&Self>,
+        targets: &BTreeSet<Target>,
+        arguments: &[String],
+        manifest_path: Option<&Path>,
+        invocation: Option<&str>,
+    ) -> io::Result<Self> {
+        Self::capture_with(
+            targets,
+            arguments,
+            manifest_path,
+            invocation,
+            |package, target| {
+                let package = previous.and_then(|snapshot| snapshot.packages.get(package));
+                TargetGraph {
+                    paths: package
+                        .and_then(|package| package.targets.get(target))
+                        .map(BTreeMap::keys),
+                    leaves: package.and_then(|package| package.leaves.get(target)),
+                    probes: package.and_then(|package| package.probes.get(target)),
+                }
+            },
+        )
+    }
+
+    /// Observes newly discovered ownership alongside the unchanged target graphs.
     fn capture(
         targets: &BTreeSet<Target>,
         arguments: &[String],
@@ -884,6 +896,27 @@ impl Snapshot {
         probes: &ProbeGraph,
         invocation: Option<&str>,
     ) -> io::Result<Self> {
+        Self::capture_with(
+            targets,
+            arguments,
+            manifest_path,
+            invocation,
+            |_, target| TargetGraph {
+                paths: modules.get(target).map(BTreeSet::iter),
+                leaves: leaves.get(target),
+                probes: probes.get(target),
+            },
+        )
+    }
+
+    /// Observes authoritative sources once each and discovers all effective formatter settings.
+    fn capture_with<'a, Paths: Iterator<Item = &'a String>>(
+        targets: &'a BTreeSet<Target>,
+        arguments: &[String],
+        manifest_path: Option<&Path>,
+        invocation: Option<&str>,
+        graph: impl Fn(&str, &str) -> TargetGraph<'a, Paths>,
+    ) -> io::Result<Self> {
         let mut packages = BTreeMap::new();
         let mut file_fingerprints = BTreeMap::new();
         let mut observed_probes = BTreeMap::new();
@@ -891,59 +924,64 @@ impl Snapshot {
 
         for target in targets {
             let package_path = path_string(&target.package_root)?;
-            let target_path = path_string(&target.path)?;
-            let paths = modules
-                .get(&target_path)
-                .cloned()
-                .unwrap_or_else(|| BTreeSet::from([target_path.clone()]));
-            if !paths.contains(&target_path) {
+            let target_path = target
+                .path
+                .to_str()
+                .ok_or_else(|| unsupported("a formatter path is not valid UTF-8"))?;
+            let graph = graph(&package_path, target_path);
+            let root_only = graph.paths.is_none().then_some(target_path);
+            let paths = graph
+                .paths
+                .into_iter()
+                .flatten()
+                .map(String::as_str)
+                .chain(root_only);
+
+            configuration_directories.insert(target.package_root.clone());
+            let mut sources = BTreeMap::new();
+            for path in paths {
+                let fingerprint = match file_fingerprints.entry(path.to_owned()) {
+                    Entry::Occupied(entry) => *entry.get(),
+                    Entry::Vacant(entry) => {
+                        let (_, metadata) = canonical_module_file(path)?;
+                        observed_probes.entry(path.to_owned()).or_insert_with(|| {
+                            ProbeObservation {
+                                canonical: Some(path.to_owned()),
+                                exists: true,
+                                is_directory: false,
+                            }
+                        });
+                        *entry.insert(SourceFingerprint::from_metadata(&metadata)?)
+                    }
+                };
+                if let Some(parent) = Path::new(path).parent() {
+                    configuration_directories.insert(parent.to_owned());
+                }
+                sources.insert(path.to_owned(), fingerprint);
+            }
+            if !sources.contains_key(target_path) {
                 return Err(unsupported(
                     "an authoritative module graph omits its target root",
                 ));
             }
-            let target_leaves = leaves.get(&target_path).cloned().unwrap_or_default();
-            if target_leaves.contains_key(&target_path)
-                || target_leaves.keys().any(|path| !paths.contains(path))
-                || target_leaves
-                    .values()
-                    .any(|digest| !valid_topology_digest(digest))
-            {
+            if graph.leaves.is_some_and(|leaves| {
+                leaves.contains_key(target_path)
+                    || leaves.keys().any(|path| !sources.contains_key(path))
+                    || leaves.values().any(|digest| !valid_topology_digest(digest))
+            }) {
                 return Err(unsupported(
                     "an authoritative leaf graph escapes its formatter target",
                 ));
             }
 
-            configuration_directories.insert(target.package_root.clone());
-            let mut sources = BTreeMap::new();
-            for path in paths {
-                let fingerprint = match file_fingerprints.entry(path.clone()) {
-                    Entry::Occupied(entry) => *entry.get(),
-                    Entry::Vacant(entry) => {
-                        let (_, metadata) = canonical_module_file(&path)?;
-                        observed_probes
-                            .entry(path.clone())
-                            .or_insert_with(|| ProbeObservation {
-                                canonical: Some(path.clone()),
-                                exists: true,
-                                is_directory: false,
-                            });
-                        *entry.insert(SourceFingerprint::from_metadata(&metadata)?)
-                    }
-                };
-                if let Some(parent) = Path::new(&path).parent() {
-                    configuration_directories.insert(parent.to_owned());
-                }
-                sources.insert(path, fingerprint);
-            }
-
             let mut target_probes = BTreeMap::new();
-            if let Some(expected) = probes.get(&target_path) {
+            if let Some(expected) = graph.probes {
                 for path in expected.keys() {
-                    let observation = match observed_probes.entry(path.clone()) {
+                    let observation = match observed_probes.entry(path.to_owned()) {
                         Entry::Occupied(entry) => entry.into_mut(),
                         Entry::Vacant(entry) => entry.insert(observe_module_probe(path)?),
                     };
-                    target_probes.insert(path.clone(), observation.clone());
+                    target_probes.insert(path.to_owned(), observation.clone());
                 }
             }
 
@@ -954,9 +992,12 @@ impl Snapshot {
                     leaves: BTreeMap::new(),
                     probes: BTreeMap::new(),
                 });
-            package.targets.insert(target_path.clone(), sources);
-            package.leaves.insert(target_path.clone(), target_leaves);
-            package.probes.insert(target_path, target_probes);
+            package.targets.insert(target_path.to_owned(), sources);
+            package.leaves.insert(
+                target_path.to_owned(),
+                graph.leaves.cloned().unwrap_or_default(),
+            );
+            package.probes.insert(target_path.to_owned(), target_probes);
         }
 
         let current_directory = env::current_dir()?.canonicalize()?;
@@ -3188,13 +3229,14 @@ mod tests {
             expected.insert(alias.clone(), observe_module_probe(&alias)?);
         }
 
+        let targets = BTreeSet::from([target(&root, &package)]);
         let snapshot = Snapshot::capture(
-            &BTreeSet::from([target(&root, &package)]),
+            &targets,
             &[],
             None,
             &ModuleGraph::from([(
                 root_path.clone(),
-                BTreeSet::from([root_path.clone(), module_path]),
+                BTreeSet::from([root_path.clone(), module_path.clone()]),
             )]),
             &LeafGraph::new(),
             &ProbeGraph::from([(root_path.clone(), expected.clone())]),
@@ -3207,6 +3249,37 @@ mod tests {
                 .get(&path_string(&package)?)
                 .and_then(|package| package.probes.get(&root_path)),
             Some(&expected),
+        );
+        assert_eq!(
+            Snapshot::capture_from_snapshot(
+                Some(&snapshot),
+                &targets,
+                &[],
+                None,
+                Some("canonical-source-probes"),
+            )?,
+            snapshot,
+        );
+
+        OpenOptions::new()
+            .write(true)
+            .open(&module)?
+            .set_modified(UNIX_EPOCH)?;
+        fs::write(&missing, "pub fn missing() {}")?;
+        let refreshed = Snapshot::capture_from_snapshot(
+            Some(&snapshot),
+            &targets,
+            &[],
+            None,
+            Some("canonical-source-probes"),
+        )?;
+        let package_path = path_string(&package)?;
+        assert_ne!(
+            refreshed.packages[&package_path].targets[&root_path][&module_path],
+            snapshot.packages[&package_path].targets[&root_path][&module_path],
+        );
+        assert!(
+            refreshed.packages[&package_path].probes[&root_path][&path_string(&missing)?].exists
         );
         Ok(())
     }
