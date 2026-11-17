@@ -184,8 +184,8 @@ fn incremental_formatting_enabled(value: Result<String, env::VarError>) -> bool 
 
 /// Formats only invalidated targets while preserving normal output and fail-closed semantics.
 ///
-/// A successful cache update additionally requires a quiet authoritative second pass and
-/// identical before/after snapshots, preventing concurrent edits from becoming false hits.
+/// Read-only checks publish their clean authoritative producer proof immediately;
+/// write-mode formatting additionally verifies a second pass before updating the cache.
 pub(super) fn format(
     targets: &BTreeSet<Target>,
     arguments: &[String],
@@ -382,6 +382,14 @@ pub(super) fn format(
             if plan.can_record(&updated, &changed_roots, check_only)
                 && updated.probe_graph() == probes =>
         {
+            if check_only {
+                trace("caching a clean read-only formatter pass without reverification");
+                if let Err(error) = write_cache(&plan.cache_path, &updated) {
+                    trace(&format!("could not update the formatting cache: {error}"));
+                }
+                return Ok(output.status);
+            }
+
             let verification =
                 verify_formatted_targets(&changed_targets, arguments, cache_directory)?;
             if verification.emitted_diagnostics {

@@ -259,3 +259,79 @@ fn cargo_fmt_logging_preserves_root_and_sibling_events_after_a_leaf_edit() -> st
     );
     Ok(())
 }
+
+#[cfg(unix)]
+#[test]
+fn cargo_fmt_caches_clean_checks_without_a_second_formatter_pass() -> std::io::Result<()> {
+    let directory = tempfile::tempdir()?;
+    let package = directory.path().canonicalize()?;
+    let tools = package.join("tools");
+    fs::create_dir(&tools)?;
+    let executable = cargo_fmt_command().get_program().to_owned();
+    let formatter = Path::new(&executable).with_file_name("rustfmt");
+    fs::copy(&executable, tools.join("cargo-fmt"))?;
+    fs::copy(formatter, tools.join("rustfmt"))?;
+    let compiler = if let Some(compiler) = env::var_os("RUSTC") {
+        std::path::PathBuf::from(compiler)
+    } else {
+        let sysroot = Command::new("rustc")
+            .args(["--print", "sysroot"])
+            .output()?;
+        if !sysroot.status.success() {
+            return Err(std::io::Error::other(
+                "the integration compiler sysroot is unavailable",
+            ));
+        }
+        let sysroot = std::str::from_utf8(&sysroot.stdout)
+            .map_err(std::io::Error::other)?
+            .trim();
+        Path::new(sysroot).join("bin").join("rustc")
+    };
+    let compiler = compiler.canonicalize()?;
+    let compiler_libraries = compiler
+        .parent()
+        .and_then(Path::parent)
+        .ok_or_else(|| std::io::Error::other("the integration compiler has no sysroot"))?
+        .join("lib");
+    std::os::unix::fs::symlink(&compiler, tools.join("rustc"))?;
+    let sources = package.join("src");
+    fs::create_dir(&sources)?;
+    let manifest = package.join("Cargo.toml");
+    fs::write(
+        &manifest,
+        "[package]\nname = \"single-pass-check\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )?;
+    fs::write(sources.join("lib.rs"), "pub fn formatted() {}\n")?;
+
+    let run = || {
+        Command::new(tools.join("cargo-fmt"))
+            .arg("--check")
+            .arg("--manifest-path")
+            .arg(&manifest)
+            .current_dir(&package)
+            .env("OHM_INCREMENTAL_FMT", "1")
+            .env("OHM_INCREMENTAL_FMT_TRACE", "1")
+            .env("OHM_INCREMENTAL_FMT_CACHE_DIR", package.join("cache"))
+            .env("DYLD_LIBRARY_PATH", &compiler_libraries)
+            .env("LD_LIBRARY_PATH", &compiler_libraries)
+            .env_remove("DYLD_FALLBACK_LIBRARY_PATH")
+            .output()
+    };
+
+    let first = run()?;
+    assert!(first.status.success());
+    let first_trace = String::from_utf8_lossy(&first.stderr);
+    assert!(
+        first_trace.contains("caching a clean read-only formatter pass without reverification"),
+        "{first_trace}",
+    );
+
+    let second = run()?;
+    assert!(second.status.success());
+    assert!(
+        String::from_utf8_lossy(&second.stderr).contains("cache hit: 1 unchanged packages"),
+        "{}",
+        String::from_utf8_lossy(&second.stderr),
+    );
+    Ok(())
+}
