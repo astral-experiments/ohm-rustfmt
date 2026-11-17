@@ -9,6 +9,8 @@ use std::time::UNIX_EPOCH;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::path_utils::canonicalize;
+
 use super::{
     RustfmtOutput, RustfmtOutputMode, SUCCESS, Target, Verbosity, run_rustfmt,
     run_rustfmt_with_output, rustfmt_command,
@@ -1234,7 +1236,7 @@ fn canonical_module_file(path: &str) -> io::Result<(PathBuf, fs::Metadata)> {
     if !path.is_absolute() {
         return Err(unsupported("an authoritative module path is not absolute"));
     }
-    let canonical = path.canonicalize()?;
+    let canonical = canonicalize(path)?;
     let metadata = fs::metadata(&canonical)?;
     if canonical != path || !metadata.is_file() {
         return Err(unsupported(
@@ -1256,7 +1258,7 @@ fn observe_module_probe(path: &str) -> io::Result<ProbeObservation> {
     let exists = metadata.is_ok();
     let is_directory = metadata.as_ref().is_ok_and(fs::Metadata::is_dir);
     let canonical = if exists {
-        Some(path_string(&path.canonicalize()?)?)
+        Some(path_string(&canonicalize(path)?)?)
     } else {
         None
     };
