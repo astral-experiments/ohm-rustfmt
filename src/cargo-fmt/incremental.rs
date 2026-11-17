@@ -1893,6 +1893,14 @@ fn has_observable_emit_mode(arguments: &[String]) -> bool {
                     .any(|flag| matches!(flag, 'v' | 'V' | 'h' | 'l')))
         {
             return true;
+        } else if matches!(
+            argument.as_str(),
+            "--color" | "--config-path" | "--edition" | "--style-edition"
+        ) {
+            // A value named `--check` must not share the proof for the check option.
+            if arguments.next().is_none_or(|value| value == "--check") {
+                return true;
+            }
         } else if argument == "--emit" {
             if check_only || arguments.next().is_none_or(|mode| mode != "files") {
                 return true;
@@ -3667,6 +3675,23 @@ mod tests {
         assert!(second.is_directory);
         assert_ne!(first, second);
         Ok(())
+    }
+
+    #[test]
+    fn check_used_as_an_option_value_requires_full_formatting() {
+        for (option, value) in [
+            ("--color", "always"),
+            ("--style-edition", "2024"),
+            ("--edition", "2024"),
+            ("--config-path", "rustfmt.toml"),
+        ] {
+            assert!(!has_observable_emit_mode(
+                &[option, value, "--check"].map(String::from)
+            ));
+            assert!(has_observable_emit_mode(
+                &[option, "--check", value].map(String::from)
+            ));
+        }
     }
 
     #[test]
