@@ -2031,6 +2031,8 @@ fn has_observable_emit_mode(arguments: &[String]) -> bool {
                 | "--version"
                 | "-V"
                 | "--verbose"
+                | "--v"
+                | "--l"
                 | "-v"
                 | "--file-lines"
         ) || argument.starts_with("--print-config=")
@@ -4043,6 +4045,8 @@ mod tests {
         assert!(has_observable_emit_mode(&[String::from("--emit=json")]));
         assert!(has_observable_emit_mode(&[String::from("--backup")]));
         assert!(has_observable_emit_mode(&[String::from("-v")]));
+        assert!(has_observable_emit_mode(&[String::from("--v")]));
+        assert!(has_observable_emit_mode(&[String::from("--l")]));
         assert!(has_observable_emit_mode(&[String::from("-lv")]));
         assert!(has_observable_emit_mode(&[String::from("-lV")]));
         assert!(has_observable_emit_mode(&[String::from("-qh")]));
