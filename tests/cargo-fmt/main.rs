@@ -335,6 +335,38 @@ fn trusted_formatter_tools(
 
 #[cfg(unix)]
 #[test]
+fn failed_mixed_edition_check_cleans_up_module_manifests() -> std::io::Result<()> {
+    let directory = tempfile::tempdir()?;
+    let package = directory.path().canonicalize()?;
+    let (tools, compiler_libraries) = trusted_formatter_tools(&package)?;
+    fs::write(
+        package.join("Cargo.toml"),
+        "[package]\nname = 'mixed'\nversion = '0.1.0'\nedition = '2021'\n\
+         [lib]\npath = 'lib.rs'\n\
+         [[bin]]\nname = 'mixed'\npath = 'main.rs'\nedition = '2024'\n",
+    )?;
+    fs::write(package.join("lib.rs"), "pub fn clean() {}\n")?;
+    fs::write(package.join("main.rs"), "fn main( ) {}\n")?;
+    let cache = package.join("cache");
+    let output = Command::new(tools.join("cargo-fmt"))
+        .arg("--check")
+        .current_dir(&package)
+        .env("OHM_INCREMENTAL_FMT", "1")
+        .env("OHM_INCREMENTAL_FMT_CACHE_DIR", &cache)
+        .env("DYLD_LIBRARY_PATH", &compiler_libraries)
+        .env("LD_LIBRARY_PATH", &compiler_libraries)
+        .env_remove("DYLD_FALLBACK_LIBRARY_PATH")
+        .output()?;
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert!(String::from_utf8_lossy(&output.stdout).contains("main.rs"));
+    for entry in fs::read_dir(cache)? {
+        assert_eq!(entry?.file_name(), ".lock");
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
 fn cargo_fmt_caches_clean_checks_without_a_second_formatter_pass() -> std::io::Result<()> {
     let directory = tempfile::tempdir()?;
     let package = directory.path().canonicalize()?;

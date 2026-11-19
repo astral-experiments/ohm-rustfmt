@@ -277,8 +277,13 @@ pub(super) fn format(
         targets.len()
     ));
 
-    let Some(cache_directory) = plan.cache_path.parent() else {
-        trace("falling back to complete formatting for an invalid cache path");
+    // A failed check can return before consuming another edition's manifest.
+    let Some(manifests) = plan
+        .cache_path
+        .parent()
+        .and_then(|directory| tempfile::tempdir_in(directory).ok())
+    else {
+        trace("falling back to complete formatting without a module manifest directory");
         return run_rustfmt(targets, arguments, verbosity);
     };
     let changed_leaves = plan.changed_leaves(&changed_roots);
@@ -300,7 +305,7 @@ pub(super) fn format(
         } else {
             RustfmtOutputMode::Inherit
         },
-        Some(cache_directory),
+        Some(manifests.path()),
         requested_modules.as_deref(),
     )?;
     if output.status != SUCCESS || output.emitted_diagnostics {
@@ -399,7 +404,7 @@ pub(super) fn format(
             arguments,
             verbosity,
             RustfmtOutputMode::Inherit,
-            Some(cache_directory),
+            Some(manifests.path()),
             None,
         )?;
         if output.status != SUCCESS || output.emitted_diagnostics {
@@ -475,7 +480,7 @@ pub(super) fn format(
             let verification = verify_formatted_targets(
                 &changed_targets,
                 arguments,
-                cache_directory,
+                manifests.path(),
                 verification_modules.as_deref(),
             )?;
             if verification.emitted_diagnostics {
