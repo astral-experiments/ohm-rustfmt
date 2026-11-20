@@ -773,7 +773,7 @@ impl<'b, T: Write + 'b> Session<'b, T> {
 
         let manifest = ModuleGraphManifest {
             schema: "ohm.rustfmt-files",
-            version: 3,
+            version: 4,
             unchanged: !self.rewritten_sources,
             roots: graph
                 .roots
@@ -1029,18 +1029,8 @@ mod unit_tests {
                 .into_iter()
                 .map(|path| Some(path.as_path())),
             Some(vec![
-                FileProbe {
-                    path: second_root.clone(),
-                    canonical: Some(second_root.canonicalize()?),
-                    exists: true,
-                    is_directory: false,
-                },
-                FileProbe {
-                    path: shared_module.clone(),
-                    canonical: Some(shared_module.canonicalize()?),
-                    exists: true,
-                    is_directory: false,
-                },
+                FileProbe::observe(&second_root, true).unwrap(),
+                FileProbe::observe(&shared_module, true).unwrap(),
             ]),
         );
         session.record_module_graph(
@@ -1057,18 +1047,8 @@ mod unit_tests {
                 .into_iter()
                 .map(|path| Some(path.as_path())),
             Some(vec![
-                FileProbe {
-                    path: first_root.clone(),
-                    canonical: Some(first_root.canonicalize()?),
-                    exists: true,
-                    is_directory: false,
-                },
-                FileProbe {
-                    path: shared_module.clone(),
-                    canonical: Some(shared_module.canonicalize()?),
-                    exists: true,
-                    is_directory: false,
-                },
+                FileProbe::observe(&first_root, true).unwrap(),
+                FileProbe::observe(&shared_module, true).unwrap(),
             ]),
         );
 
@@ -1078,7 +1058,7 @@ mod unit_tests {
             serde_json::from_slice(&fs::read(manifest_path)?).map_err(io::Error::other)?;
 
         assert_eq!(manifest["schema"], "ohm.rustfmt-files");
-        assert_eq!(manifest["version"], 3);
+        assert_eq!(manifest["version"], 4);
         assert_eq!(manifest["unchanged"], true);
         assert_eq!(
             manifest["roots"][0]["path"],
@@ -1126,6 +1106,7 @@ mod unit_tests {
         fs::write(&parsed, "#![rustfmt::skip]\nfn parsed( ){ }\n")?;
         fs::write(&skipped, "fn skipped( {{{\n")?;
 
+        let before_write = path_utils::SourceFingerprint::from_metadata(&fs::metadata(&external)?)?;
         let mut configuration = Config::default();
         configuration.set().emit_mode(EmitMode::Files);
         let mut output = Vec::new();
@@ -1156,6 +1137,12 @@ mod unit_tests {
         let probes = manifest["roots"][0]["probes"]
             .as_array()
             .ok_or_else(|| io::Error::other("module probes missing"))?;
+        let external_path = external.canonicalize()?;
+        let before_write = serde_json::to_value(before_write)?;
+        assert!(probes.iter().any(|probe| {
+            probe["canonical"].as_str() == external_path.to_str()
+                && probe["fingerprint"] == before_write
+        }));
         let parsed_path = parsed.canonicalize()?;
         let skipped_path = skipped.canonicalize()?;
         let alternate_parsed_path = directory.path().join("parsed/mod.rs");
@@ -1757,12 +1744,7 @@ mod unit_tests {
             [FileName::Real(module)].iter(),
             std::iter::empty(),
             [root.as_path()].into_iter().map(Some),
-            Some(vec![FileProbe {
-                path: root.clone(),
-                canonical: Some(root.canonicalize()?),
-                exists: true,
-                is_directory: false,
-            }]),
+            Some(vec![FileProbe::observe(&root, true).unwrap()]),
         );
 
         let manifest_path = directory.path().join("modules.json");
