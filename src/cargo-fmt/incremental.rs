@@ -1506,33 +1506,39 @@ fn collect_explicit_configuration(
             continue;
         };
 
-        if path.is_dir() {
-            collect_configuration_file(&path.join("rustfmt.toml"), configuration)?;
-            collect_configuration_file(&path.join(".rustfmt.toml"), configuration)?;
+        let recorded = if path.is_dir() {
+            let visible = collect_configuration_file(&path.join("rustfmt.toml"), configuration)?;
+            let hidden = collect_configuration_file(&path.join(".rustfmt.toml"), configuration)?;
+            visible || hidden
         } else {
             reject_observable_formatter_configuration(&path)?;
-            collect_configuration_file(&path, configuration)?;
+            collect_configuration_file(&path, configuration)?
+        };
+        if !recorded {
+            return Err(unsupported(
+                "explicit configuration requires a regular file",
+            ));
         }
     }
 
     Ok(())
 }
 
-/// Hashes existing settings under their logical names so symlink precedence remains visible.
+/// Records settings under their logical names and reports whether the path is a regular file.
 fn collect_configuration_file(
     path: &Path,
     configuration: &mut BTreeMap<String, String>,
-) -> io::Result<()> {
+) -> io::Result<bool> {
     match fs::metadata(path) {
         Ok(metadata) if metadata.is_file() => {}
-        Ok(_) => return Ok(()),
+        Ok(_) => return Ok(false),
         Err(error)
             if matches!(
                 error.kind(),
                 io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
             ) =>
         {
-            return Ok(());
+            return Ok(false);
         }
         Err(error) => return Err(error),
     }
@@ -1559,7 +1565,7 @@ fn collect_configuration_file(
         let digest = hash_file_contents(&canonical_path)?;
         configuration.insert(key, format!("{canonical}:{digest}"));
     }
-    Ok(())
+    Ok(true)
 }
 
 /// Refuses settings that could make a skipped formatter invocation externally observable.
@@ -3079,6 +3085,27 @@ mod tests {
         assert!(after.contains_key(&path_string(&cargo)?));
         assert!(after.contains_key(&path_string(&local)?));
         Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn explicit_configuration_requires_a_regular_file() -> io::Result<()> {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("override.toml");
+        let arguments = [format!("--config-path={}", path.display())];
+        let collect = || collect_explicit_configuration(&arguments, &mut BTreeMap::new());
+
+        symlink("/dev/null", &path)?;
+        assert!(collect().is_err());
+        fs::remove_file(&path)?;
+        assert!(collect().is_err());
+
+        fs::create_dir(&path)?;
+        assert!(collect().is_err());
+        fs::write(path.join(".rustfmt.toml"), "tab_spaces = 2\n")?;
+        collect()
     }
 
     #[cfg(unix)]
