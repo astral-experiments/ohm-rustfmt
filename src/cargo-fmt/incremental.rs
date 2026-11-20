@@ -18,7 +18,7 @@ use super::{
     run_rustfmt_with_output, rustfmt_command,
 };
 
-const CACHE_VERSION: u32 = 12;
+const CACHE_VERSION: u32 = 13;
 const MODULE_MANIFEST_VERSION: u32 = 3;
 const MODULE_MANIFEST_SCHEMA: &str = "ohm.rustfmt-files";
 const MODULE_MANIFEST_ENVIRONMENT: &str = "OHM_RUSTFMT_MODULE_MANIFEST";
@@ -448,7 +448,12 @@ pub(super) fn format(
                         changed_leaves.as_deref().unwrap_or_default(),
                     )) =>
         {
-            if !rewritten_leaf && (check_only || unchanged) {
+            let Some(verification_targets) = plan.verification_targets(
+                &updated,
+                !rewritten_leaf && (check_only || unchanged),
+                targets,
+                &changed_targets,
+            ) else {
                 if check_only {
                     trace("caching a clean read-only formatter pass without reverification");
                 } else {
@@ -458,7 +463,7 @@ pub(super) fn format(
                     trace(&format!("could not update the formatting cache: {error}"));
                 }
                 return Ok(output.status);
-            }
+            };
 
             let verification_leaves = if rewritten_leaf {
                 changed_leaves.clone()
@@ -478,7 +483,7 @@ pub(super) fn format(
                 ));
             }
             let verification = verify_formatted_targets(
-                &changed_targets,
+                verification_targets,
                 arguments,
                 manifests.path(),
                 verification_modules.as_deref(),
@@ -504,7 +509,7 @@ pub(super) fn format(
                 }
                 let verification_discovery = match read_module_manifests(
                     &verification.module_manifests,
-                    &changed_targets,
+                    verification_targets,
                 ) {
                     Ok(discovery) => discovery,
                     Err(error) => {
@@ -944,6 +949,21 @@ impl Plan {
             && (updated == &self.current
                 || Self::changed_leaves_between(&self.current, updated, changed_roots)
                     .is_some_and(|changes| changes.iter().all(|leaf| selected.contains(leaf))))
+    }
+
+    /// A newly discovered configuration can affect targets outside the initial formatting pass.
+    fn verification_targets<'a>(
+        &self,
+        updated: &Snapshot,
+        clean: bool,
+        targets: &'a BTreeSet<Target>,
+        changed: &'a BTreeSet<Target>,
+    ) -> Option<&'a BTreeSet<Target>> {
+        if self.current.configuration != updated.configuration {
+            Some(targets)
+        } else {
+            (!clean).then_some(changed)
+        }
     }
 
     /// Rejects concurrent source/configuration changes while allowing newly discovered configs.
@@ -3545,6 +3565,29 @@ mod tests {
             &BTreeSet::from(["/workspace/first/src/lib.rs"]),
             true,
         ));
+    }
+
+    #[test]
+    fn added_configuration_requires_verifying_previously_clean_targets() {
+        let current = snapshot(&[
+            ("/first", &[("lib.rs", "clean")]),
+            ("/second", &[("lib.rs", "changed")]),
+        ]);
+        let mut updated = current.clone();
+        updated
+            .configuration
+            .insert("/first/rustfmt.toml".into(), "new indentation".into());
+        let first = target(Path::new("/first/lib.rs"), Path::new("/first"));
+        let second = target(Path::new("/second/lib.rs"), Path::new("/second"));
+        let targets = BTreeSet::from([first, second.clone()]);
+        let changed = BTreeSet::from([second]);
+        let plan = plan(None, current);
+        for clean in [true, false] {
+            assert_eq!(
+                plan.verification_targets(&updated, clean, &targets, &changed),
+                Some(&targets),
+            );
+        }
     }
 
     #[test]
