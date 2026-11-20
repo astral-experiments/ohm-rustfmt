@@ -6,20 +6,21 @@ use std::io::{self, Read, Write};
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
+#[cfg(test)]
 use std::time::UNIX_EPOCH;
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::path_utils::{canonicalize, canonicalize_with_handle};
+use crate::path_utils::{SourceFingerprint, canonicalize, canonicalize_with_metadata};
 
 use super::{
     RustfmtOutput, RustfmtOutputMode, SUCCESS, Target, Verbosity, run_rustfmt,
     run_rustfmt_with_output, rustfmt_command,
 };
 
-const CACHE_VERSION: u32 = 13;
-const MODULE_MANIFEST_VERSION: u32 = 3;
+const CACHE_VERSION: u32 = 14;
+const MODULE_MANIFEST_VERSION: u32 = 4;
 const MODULE_MANIFEST_SCHEMA: &str = "ohm.rustfmt-files";
 const MODULE_MANIFEST_ENVIRONMENT: &str = "OHM_RUSTFMT_MODULE_MANIFEST";
 const CHANGED_MODULE_ENVIRONMENT: &str = "OHM_RUSTFMT_CHANGED_MODULE";
@@ -32,7 +33,7 @@ const ENABLE_ENVIRONMENT: &str = "OHM_INCREMENTAL_FMT";
 const CACHE_ENVIRONMENT: &str = "OHM_INCREMENTAL_FMT_CACHE_DIR";
 const TRACE_ENVIRONMENT: &str = "OHM_INCREMENTAL_FMT_TRACE";
 
-type ModuleGraph = BTreeMap<String, BTreeSet<String>>;
+type ModuleGraph = BTreeMap<String, BTreeMap<String, SourceFingerprint>>;
 type LeafGraph = BTreeMap<String, BTreeMap<String, String>>;
 type ProbeGraph = BTreeMap<String, BTreeMap<String, ProbeObservation>>;
 
@@ -50,58 +51,9 @@ struct Snapshot {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PackageSnapshot {
-    targets: BTreeMap<String, BTreeMap<String, SourceFingerprint>>,
+    targets: ModuleGraph,
     leaves: LeafGraph,
     probes: BTreeMap<String, BTreeMap<String, ProbeObservation>>,
-}
-
-/// Mirrors Ruff's source identity without reading the contents of cached files.
-///
-/// Like Ruff, this deliberately trusts filesystem modification timestamps. An
-/// edit that also restores its previous timestamp and permissions is therefore
-/// outside the cache's trust boundary.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct SourceFingerprint {
-    modified_seconds: i64,
-    modified_nanoseconds: u32,
-    permissions_mode: u32,
-}
-
-impl SourceFingerprint {
-    /// Encodes precise modification time and permissions without reading source contents.
-    fn from_metadata(metadata: &fs::Metadata) -> io::Result<Self> {
-        let modified = metadata.modified()?;
-        let nanoseconds = match modified.duration_since(UNIX_EPOCH) {
-            Ok(duration) => {
-                i128::from(duration.as_secs()) * 1_000_000_000 + i128::from(duration.subsec_nanos())
-            }
-            Err(error) => {
-                let duration = error.duration();
-                -(i128::from(duration.as_secs()) * 1_000_000_000
-                    + i128::from(duration.subsec_nanos()))
-            }
-        };
-        let modified_seconds =
-            i64::try_from(nanoseconds.div_euclid(1_000_000_000)).map_err(io::Error::other)?;
-        let modified_nanoseconds =
-            u32::try_from(nanoseconds.rem_euclid(1_000_000_000)).map_err(io::Error::other)?;
-
-        #[cfg(unix)]
-        let permissions_mode = {
-            use std::os::unix::fs::PermissionsExt;
-
-            metadata.permissions().mode()
-        };
-        #[cfg(not(unix))]
-        let permissions_mode = u32::from(metadata.permissions().readonly());
-
-        Ok(Self {
-            modified_seconds,
-            modified_nanoseconds,
-            permissions_mode,
-        })
-    }
 }
 
 /// Captures existence, symlink destination, and directory-sensitive module resolution.
@@ -136,6 +88,7 @@ struct ModuleRoot {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ModuleProbe {
+    fingerprint: Option<SourceFingerprint>,
     path: String,
     canonical: Option<String>,
     exists: bool,
@@ -450,7 +403,9 @@ pub(super) fn format(
         {
             let Some(verification_targets) = plan.verification_targets(
                 &updated,
-                !rewritten_leaf && (check_only || unchanged),
+                !rewritten_leaf
+                    && (check_only || unchanged)
+                    && updated.matches_source_inputs(&modules),
                 targets,
                 &changed_targets,
             ) else {
@@ -702,7 +657,9 @@ fn discovery_matches(
     discovered.modules.len() == discovered.probes.len()
         && discovered.modules.len() == discovered.leaves.len()
         && discovered.modules.iter().all(|(root, files)| {
-            modules.get(root) == Some(files)
+            modules
+                .get(root)
+                .is_some_and(|inputs| inputs.keys().eq(files.keys()))
                 && discovered.leaves.get(root) == leaves.get(root)
                 && discovered.probes.get(root) == probes.get(root)
         })
@@ -716,10 +673,10 @@ fn discovers_new_shared_owner(
 ) -> bool {
     discovered.iter().any(|(root, files)| {
         let old_files = previous.get(root);
-        files.iter().any(|file| {
-            !old_files.is_some_and(|previous| previous.contains(file))
+        files.keys().any(|file| {
+            !old_files.is_some_and(|previous| previous.contains_key(file))
                 && previous.iter().any(|(other_root, other_files)| {
-                    !selected.contains(other_root.as_str()) && other_files.contains(file)
+                    !selected.contains(other_root.as_str()) && other_files.contains_key(file)
                 })
         })
     })
@@ -1069,7 +1026,7 @@ impl Snapshot {
             manifest_path,
             invocation,
             |_, target| TargetGraph {
-                paths: modules.get(target).map(BTreeSet::iter),
+                paths: modules.get(target).map(BTreeMap::keys),
                 leaves: leaves.get(target),
                 probes: probes.get(target),
             },
@@ -1195,17 +1152,19 @@ impl Snapshot {
         })
     }
 
+    /// Confirms the saved versions include exactly what rustfmt saw in newly discovered modules.
+    fn matches_source_inputs(&self, modules: &ModuleGraph) -> bool {
+        self.packages
+            .values()
+            .flat_map(|package| &package.targets)
+            .all(|(target, sources)| modules.get(target) == Some(sources))
+    }
+
     fn module_graph(&self) -> ModuleGraph {
         self.packages
             .values()
-            .flat_map(|package| {
-                package.targets.iter().map(|(target, files)| {
-                    (
-                        target.clone(),
-                        files.keys().cloned().collect::<BTreeSet<_>>(),
-                    )
-                })
-            })
+            .flat_map(|package| &package.targets)
+            .map(|(target, sources)| (target.clone(), sources.clone()))
             .collect()
     }
 
@@ -1366,7 +1325,7 @@ fn read_module_manifests(paths: &[PathBuf], targets: &BTreeSet<Target>) -> io::R
             }
 
             let mut observations = BTreeMap::new();
-            let mut observed_dependencies = BTreeSet::new();
+            let mut observed_dependencies = BTreeMap::new();
             for probe in root.probes {
                 let expected = ProbeObservation {
                     canonical: probe.canonical,
@@ -1385,8 +1344,20 @@ fn read_module_manifests(paths: &[PathBuf], targets: &BTreeSet<Target>) -> io::R
                         "an authoritative source probe changed during formatting",
                     ));
                 }
-                if let Some(canonical) = expected.canonical.as_ref() {
-                    observed_dependencies.insert(canonical.clone());
+                if let Some(canonical) = expected
+                    .canonical
+                    .as_ref()
+                    .filter(|path| dependencies.contains(*path))
+                {
+                    let fingerprint = probe.fingerprint.ok_or_else(|| {
+                        unsupported("the authoritative module manifest lacks a source fingerprint")
+                    })?;
+                    if observed_dependencies
+                        .insert(canonical.clone(), fingerprint)
+                        .is_some_and(|previous| previous != fingerprint)
+                    {
+                        return Err(unsupported("a source changed between parser probes"));
+                    }
                 }
                 if observations.insert(probe.path, expected).is_some() {
                     return Err(unsupported(
@@ -1394,15 +1365,14 @@ fn read_module_manifests(paths: &[PathBuf], targets: &BTreeSet<Target>) -> io::R
                     ));
                 }
             }
-            if !dependencies.is_subset(&observed_dependencies) {
+            if dependencies.len() != observed_dependencies.len() {
                 return Err(unsupported(
                     "the authoritative module manifest omits a loaded source probe",
                 ));
             }
-            files.extend(dependencies);
             probe_roots.insert(root.path.clone(), observations);
             leaf_roots.insert(root.path.clone(), leaves);
-            roots.insert(root.path, files);
+            roots.insert(root.path, observed_dependencies);
         }
     }
 
@@ -1442,11 +1412,7 @@ fn canonical_module_file(path: &str) -> io::Result<(PathBuf, fs::Metadata)> {
     if !path.is_absolute() {
         return Err(unsupported("an authoritative module path is not absolute"));
     }
-    let (canonical, handle) = canonicalize_with_handle(path)?;
-    let metadata = match handle {
-        Some(handle) => handle.metadata()?,
-        None => fs::metadata(&canonical)?,
-    };
+    let (canonical, metadata) = canonicalize_with_metadata(path)?;
     if canonical != path || !metadata.is_file() {
         return Err(unsupported(
             "an authoritative module path is not a canonical source file",
@@ -2297,6 +2263,10 @@ mod tests {
         let path = path_string(path)?;
         let observation = observe_module_probe(&path)?;
         Ok(ModuleProbe {
+            fingerprint: fs::metadata(&path)
+                .ok()
+                .map(|m| SourceFingerprint::from_metadata(&m))
+                .transpose()?,
             path,
             canonical: observation.canonical,
             exists: observation.exists,
@@ -2898,8 +2868,13 @@ mod tests {
     fn verification_rejects_concurrently_changed_module_and_probe_graphs() {
         let root = String::from("/workspace/first/src/lib.rs");
         let module = String::from("/workspace/first/src/nested.rs");
-        let modules =
-            ModuleGraph::from([(root.clone(), BTreeSet::from([root.clone(), module.clone()]))]);
+        let modules = ModuleGraph::from([(
+            root.clone(),
+            BTreeMap::from([
+                (root.clone(), fingerprint("root")),
+                (module.clone(), fingerprint("module")),
+            ]),
+        )]);
         let probes = ProbeGraph::from([(
             root.clone(),
             BTreeMap::from([(
@@ -2922,7 +2897,10 @@ mod tests {
 
         let mut changed_modules = discovery.clone();
         if let Some(files) = changed_modules.modules.get_mut(&root) {
-            files.insert(String::from("/workspace/first/src/replacement.rs"));
+            files.insert(
+                String::from("/workspace/first/src/replacement.rs"),
+                fingerprint("replacement"),
+            );
         }
         assert!(!discovery_matches(
             &changed_modules,
@@ -3000,26 +2978,22 @@ mod tests {
 
     #[test]
     fn newly_discovered_shared_owner_requires_a_complete_second_pass() {
-        let previous = ModuleGraph::from([
+        let previous = snapshot(&[
+            ("/workspace/first", &[("src/lib.rs", "first")]),
             (
-                String::from("/workspace/first/src/lib.rs"),
-                BTreeSet::from([String::from("/workspace/first/src/lib.rs")]),
+                "/workspace/second",
+                &[("src/lib.rs", "second"), ("src/shared.rs", "shared")],
             ),
-            (
-                String::from("/workspace/second/src/lib.rs"),
-                BTreeSet::from([
-                    String::from("/workspace/second/src/lib.rs"),
-                    String::from("/workspace/second/src/shared.rs"),
-                ]),
-            ),
-        ]);
-        let discovered = ModuleGraph::from([(
-            String::from("/workspace/first/src/lib.rs"),
-            BTreeSet::from([
-                String::from("/workspace/first/src/lib.rs"),
-                String::from("/workspace/second/src/shared.rs"),
-            ]),
-        )]);
+        ])
+        .module_graph();
+        let discovered = snapshot(&[(
+            "/workspace/first",
+            &[
+                ("src/lib.rs", "first"),
+                ("/workspace/second/src/shared.rs", "shared"),
+            ],
+        )])
+        .module_graph();
 
         assert!(discovers_new_shared_owner(
             &previous,
@@ -3511,6 +3485,24 @@ mod tests {
     }
 
     #[test]
+    fn a_discovered_module_must_still_match_the_input_rustfmt_checked() {
+        let checked = snapshot(&[(
+            "/workspace",
+            &[("src/lib.rs", "root"), ("src/child.rs", "checked")],
+        )]);
+        let edited = snapshot(&[(
+            "/workspace",
+            &[
+                ("src/lib.rs", "root"),
+                ("src/child.rs", "edited concurrently"),
+            ],
+        )]);
+        let modules = checked.module_graph();
+        assert!(checked.matches_source_inputs(&modules));
+        assert!(!edited.matches_source_inputs(&modules));
+    }
+
+    #[test]
     fn concurrently_changed_selected_targets_are_not_cached_after_checking() {
         let current = snapshot(&[("/workspace/first", &[("src/lib.rs", "before-checking")])]);
         let updated = snapshot(&[("/workspace/first", &[("src/lib.rs", "edited-concurrently")])]);
@@ -3631,12 +3623,15 @@ mod tests {
             &BTreeSet::from([target(&root, &package)]),
         )?;
         assert_eq!(
-            graph.modules.get(&path_string(&root)?),
-            Some(&BTreeSet::from([
+            graph.modules[&path_string(&root)?]
+                .keys()
+                .cloned()
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([
                 path_string(&root)?,
                 path_string(&generated)?,
                 path_string(&shared)?,
-            ]))
+            ])
         );
         assert!(!manifest_path.exists());
         Ok(())
@@ -3913,7 +3908,10 @@ mod tests {
             None,
             &ModuleGraph::from([(
                 root_path.clone(),
-                BTreeSet::from([root_path.clone(), module_path.clone()]),
+                BTreeMap::from([
+                    (root_path.clone(), fingerprint("root")),
+                    (module_path.clone(), fingerprint("module")),
+                ]),
             )]),
             &LeafGraph::new(),
             &ProbeGraph::from([(root_path.clone(), expected.clone())]),

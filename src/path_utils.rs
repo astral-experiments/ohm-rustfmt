@@ -1,12 +1,72 @@
-use std::fs::File;
+use std::fs::{File, Metadata};
 use std::io;
 use std::path::{Path, PathBuf};
+use std::time::UNIX_EPOCH;
+
+/// Mirrors Ruff's source identity without reading the contents of cached files.
+///
+/// Like Ruff, this deliberately trusts filesystem modification timestamps. An
+/// edit that also restores its previous timestamp and permissions is therefore
+/// outside the cache's trust boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SourceFingerprint {
+    pub(crate) modified_seconds: i64,
+    pub(crate) modified_nanoseconds: u32,
+    pub(crate) permissions_mode: u32,
+}
+
+impl SourceFingerprint {
+    /// Encodes precise modification time and permissions without reading source contents.
+    pub(crate) fn from_metadata(metadata: &Metadata) -> io::Result<Self> {
+        let modified = metadata.modified()?;
+        let nanoseconds = match modified.duration_since(UNIX_EPOCH) {
+            Ok(duration) => {
+                i128::from(duration.as_secs()) * 1_000_000_000 + i128::from(duration.subsec_nanos())
+            }
+            Err(error) => {
+                let duration = error.duration();
+                -(i128::from(duration.as_secs()) * 1_000_000_000
+                    + i128::from(duration.subsec_nanos()))
+            }
+        };
+        let modified_seconds =
+            i64::try_from(nanoseconds.div_euclid(1_000_000_000)).map_err(io::Error::other)?;
+        let modified_nanoseconds =
+            u32::try_from(nanoseconds.rem_euclid(1_000_000_000)).map_err(io::Error::other)?;
+
+        #[cfg(unix)]
+        let permissions_mode = {
+            use std::os::unix::fs::PermissionsExt;
+
+            metadata.permissions().mode()
+        };
+        #[cfg(not(unix))]
+        let permissions_mode = u32::from(metadata.permissions().readonly());
+
+        Ok(Self {
+            modified_seconds,
+            modified_nanoseconds,
+            permissions_mode,
+        })
+    }
+}
 
 /// Resolves paths without walking every component in userspace when Linux proves
 /// that an absolute path contains no symlinks. Every call checks the filesystem;
 /// aliases, parent components, and unsupported kernels use normal canonicalization.
 pub(crate) fn canonicalize(path: &Path) -> io::Result<PathBuf> {
     canonicalize_with_handle(path).map(|(canonical, _)| canonical)
+}
+
+/// Uses the same file handle for resolution and metadata when the platform supports it.
+pub(crate) fn canonicalize_with_metadata(path: &Path) -> io::Result<(PathBuf, Metadata)> {
+    let (canonical, handle) = canonicalize_with_handle(path)?;
+    let metadata = match handle {
+        Some(handle) => handle.metadata()?,
+        None => std::fs::metadata(&canonical)?,
+    };
+    Ok((canonical, metadata))
 }
 
 /// Retains Linux's fresh symlink-free path handle for metadata queries when available.
