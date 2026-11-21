@@ -3,6 +3,33 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
+pub(crate) const CONFIG_FILE_NAMES: [&str; 2] = [".rustfmt.toml", "rustfmt.toml"];
+
+/// Directories searched for a root's formatting configuration, in precedence order.
+pub(crate) fn configuration_directories(directory: &Path) -> impl Iterator<Item = PathBuf> + '_ {
+    directory
+        .ancestors()
+        .map(Path::to_owned)
+        .chain(global_configuration_directories())
+}
+
+/// Fallback configuration locations shared by rustfmt and cargo-fmt.
+pub(crate) fn global_configuration_directories() -> impl Iterator<Item = PathBuf> {
+    std::iter::once_with(dirs::home_dir).flatten().chain(
+        std::iter::once_with(dirs::config_dir)
+            .flatten()
+            .map(|dir| dir.join("rustfmt")),
+    )
+}
+
+/// Delimits each root's canonical configuration and content hash. An empty
+/// identity represents the built-in defaults.
+pub(crate) fn hash_configuration(digest: &mut sha2::Sha256, identity: &str) {
+    use sha2::Digest;
+    digest.update(identity);
+    digest.update([0]);
+}
+
 /// Mirrors Ruff's source identity without reading the contents of cached files.
 ///
 /// Like Ruff, this deliberately trusts filesystem modification timestamps. An

@@ -19,16 +19,16 @@ use super::{
     run_rustfmt_with_output, rustfmt_command,
 };
 
-const CACHE_VERSION: u32 = 14;
-const MODULE_MANIFEST_VERSION: u32 = 4;
+const CACHE_VERSION: u32 = 15;
+const MODULE_MANIFEST_VERSION: u32 = 5;
 const MODULE_MANIFEST_SCHEMA: &str = "ohm.rustfmt-files";
 const MODULE_MANIFEST_ENVIRONMENT: &str = "OHM_RUSTFMT_MODULE_MANIFEST";
 const CHANGED_MODULE_ENVIRONMENT: &str = "OHM_RUSTFMT_CHANGED_MODULE";
 const MODULE_TOPOLOGY_ENVIRONMENT: &str = "OHM_RUSTFMT_MODULE_TOPOLOGY";
 const MODULE_WRITE_ENVIRONMENT: &str = "OHM_RUSTFMT_ALLOW_MODULE_WRITE";
 const LEAF_CERTIFICATE_SCHEMA: &str = "ohm.rustfmt-leaf";
-const LEAF_CERTIFICATE_VERSION: u32 = 3;
-const LEAF_WRITE_CERTIFICATE_VERSION: u32 = 4;
+const LEAF_CERTIFICATE_VERSION: u32 = 5;
+const LEAF_WRITE_CERTIFICATE_VERSION: u32 = 6;
 const ENABLE_ENVIRONMENT: &str = "OHM_INCREMENTAL_FMT";
 const CACHE_ENVIRONMENT: &str = "OHM_INCREMENTAL_FMT_CACHE_DIR";
 const TRACE_ENVIRONMENT: &str = "OHM_INCREMENTAL_FMT_TRACE";
@@ -40,7 +40,7 @@ type ProbeGraph = BTreeMap<String, BTreeMap<String, ProbeObservation>>;
 /// Versioned proof that a specific invocation formatted every recorded package successfully.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Snapshot {
+pub(super) struct Snapshot {
     version: u32,
     invocation: String,
     configuration: BTreeMap<String, String>,
@@ -258,7 +258,7 @@ pub(super) fn format(
         } else {
             RustfmtOutputMode::Inherit
         },
-        Some(manifests.path()),
+        Some((manifests.path(), &plan.current)),
         requested_modules.as_deref(),
     )?;
     if output.status != SUCCESS || output.emitted_diagnostics {
@@ -312,7 +312,7 @@ pub(super) fn format(
     let mut discovered = if rewritten_leaf {
         trace("formatted one direct leaf with a pending write certificate");
         // Reuse the cached graph only after validating that the requested leaf
-        // alone changed, a read-only pass proves v3, and the full snapshot is stable.
+        // alone changed, a read-only pass proves it clean, and the full snapshot is stable.
         Discovery {
             modules: ModuleGraph::new(),
             leaves: LeafGraph::new(),
@@ -357,7 +357,7 @@ pub(super) fn format(
             arguments,
             verbosity,
             RustfmtOutputMode::Inherit,
-            Some(manifests.path()),
+            Some((manifests.path(), &plan.current)),
             None,
         )?;
         if output.status != SUCCESS || output.emitted_diagnostics {
@@ -440,7 +440,7 @@ pub(super) fn format(
             let verification = verify_formatted_targets(
                 verification_targets,
                 arguments,
-                manifests.path(),
+                (manifests.path(), &updated),
                 verification_modules.as_deref(),
             )?;
             if verification.emitted_diagnostics {
@@ -633,7 +633,7 @@ fn lock_cache_file(path: &Path) -> io::Result<File> {
 fn verify_formatted_targets(
     targets: &BTreeSet<Target>,
     arguments: &[String],
-    manifest_directory: &Path,
+    manifest_inputs: (&Path, &Snapshot),
     changed_modules: Option<&[(PathBuf, String)]>,
 ) -> io::Result<RustfmtOutput> {
     let check_arguments = verification_arguments(arguments);
@@ -642,7 +642,7 @@ fn verify_formatted_targets(
         &check_arguments,
         Verbosity::Quiet,
         RustfmtOutputMode::CaptureQuietly,
-        Some(manifest_directory),
+        Some(manifest_inputs),
         changed_modules,
     )
 }
@@ -984,6 +984,32 @@ struct TargetGraph<'a, Paths> {
 }
 
 impl Snapshot {
+    /// Identifies the expected configuration for each file in rustfmt's argument
+    /// order using the configuration files already captured in this snapshot.
+    pub(super) fn configuration_digest(&self, files: &[&PathBuf], arguments: &[String]) -> String {
+        use crate::path_utils::{CONFIG_FILE_NAMES, configuration_directories, hash_configuration};
+        let identity = |path: &Path| self.configuration.get(path.to_str()?);
+        let in_directory = |dir: &Path| {
+            CONFIG_FILE_NAMES
+                .iter()
+                .find_map(|name| identity(&dir.join(name)))
+        };
+        let explicit = explicit_configuration_paths(arguments)
+            .next()
+            .and_then(|path| {
+                let path = env::current_dir().ok()?.join(path);
+                identity(&path).or_else(|| in_directory(&path))
+            });
+        let mut digest = Sha256::new();
+        for file in files {
+            let selected = explicit.or_else(|| {
+                configuration_directories(file.parent()?).find_map(|dir| in_directory(&dir))
+            });
+            hash_configuration(&mut digest, selected.map_or("", String::as_str));
+        }
+        format!("{:x}", digest.finalize())
+    }
+
     /// Replays cached ownership without copying its source, leaf, and probe graphs.
     fn capture_from_snapshot(
         previous: Option<&Self>,
@@ -1474,14 +1500,8 @@ fn collect_ancestor_configuration(
 
 /// Includes the home and platform-specific formatter configuration search locations.
 fn collect_global_configuration(configuration: &mut BTreeMap<String, String>) -> io::Result<()> {
-    for directory in [
-        dirs::home_dir(),
-        dirs::config_dir().map(|path| path.join("rustfmt")),
-    ]
-    .into_iter()
-    .flatten()
-    {
-        for name in [".rustfmt.toml", "rustfmt.toml"] {
+    for directory in crate::path_utils::global_configuration_directories() {
+        for name in crate::path_utils::CONFIG_FILE_NAMES {
             collect_configuration_file(&directory.join(name), configuration)?;
         }
     }
@@ -1489,30 +1509,35 @@ fn collect_global_configuration(configuration: &mut BTreeMap<String, String>) ->
     Ok(())
 }
 
+/// Reads the config path operands in the order supplied to rustfmt.
+fn explicit_configuration_paths(arguments: &[String]) -> impl Iterator<Item = &Path> {
+    let mut arguments = arguments.iter();
+    std::iter::from_fn(move || {
+        while let Some(arg) = arguments.next() {
+            if arg == "--config-path" {
+                return arguments.next().map(Path::new);
+            }
+            if let Some(path) = arg.strip_prefix("--config-path=") {
+                return Some(Path::new(path));
+            }
+        }
+        None
+    })
+}
+
 /// Resolves explicit configuration files/directories without losing observable-mode checks.
 fn collect_explicit_configuration(
     arguments: &[String],
     configuration: &mut BTreeMap<String, String>,
 ) -> io::Result<()> {
-    let mut arguments = arguments.iter();
-    while let Some(argument) = arguments.next() {
-        let path = if argument == "--config-path" {
-            arguments.next().map(PathBuf::from)
-        } else {
-            argument.strip_prefix("--config-path=").map(PathBuf::from)
-        };
-
-        let Some(path) = path else {
-            continue;
-        };
-
+    for path in explicit_configuration_paths(arguments) {
         let recorded = if path.is_dir() {
             let visible = collect_configuration_file(&path.join("rustfmt.toml"), configuration)?;
             let hidden = collect_configuration_file(&path.join(".rustfmt.toml"), configuration)?;
             visible || hidden
         } else {
-            reject_observable_formatter_configuration(&path)?;
-            collect_configuration_file(&path, configuration)?
+            reject_observable_formatter_configuration(path)?;
+            collect_configuration_file(path, configuration)?
         };
         if !recorded {
             return Err(unsupported(
@@ -2405,10 +2430,19 @@ mod tests {
             .collect::<io::Result<Vec<_>>>()?;
         let path = directory.path().join("certificate.json");
         for (version, count, expected) in [
-            (3, 1, Some(LeafCertificateKind::Unchanged)),
-            (4, 1, Some(LeafCertificateKind::Rewritten)),
-            (4, 2, None),
-            (5, 1, None),
+            (
+                LEAF_CERTIFICATE_VERSION,
+                1,
+                Some(LeafCertificateKind::Unchanged),
+            ),
+            (
+                LEAF_WRITE_CERTIFICATE_VERSION,
+                1,
+                Some(LeafCertificateKind::Rewritten),
+            ),
+            (LEAF_WRITE_CERTIFICATE_VERSION, 2, None),
+            (3, 1, None),
+            (4, 1, None),
         ] {
             let certificate = LeafCertificate {
                 schema: LEAF_CERTIFICATE_SCHEMA.to_owned(),
