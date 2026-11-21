@@ -65,6 +65,15 @@ where
         }
     }
 
+    let read_source = || {
+        let path = ensure_real_path(filename);
+        match psess {
+            Some(psess) => psess.read_source(path),
+            None => fs::read_to_string(path),
+        }
+        .map(Arc::new)
+    };
+
     // SourceFile's in the SourceMap will always have Unix-style line endings
     // See: https://github.com/rust-lang/rustfmt/issues/3850
     // So if the user has explicitly overridden the rustfmt `newline_style`
@@ -75,11 +84,11 @@ where
     // source map instead of hitting the file system. This also supports getting
     // original text for `FileName::Stdin`.
     let original_text = if newline_style != NewlineStyle::Auto && *filename != FileName::Stdin {
-        Arc::new(fs::read_to_string(ensure_real_path(filename))?)
+        read_source()?
     } else {
         match psess.and_then(|psess| psess.get_original_snippet(filename)) {
             Some(ori) => ori,
-            None => Arc::new(fs::read_to_string(ensure_real_path(filename))?),
+            None => read_source()?,
         }
     };
 

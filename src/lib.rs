@@ -793,7 +793,7 @@ impl<'b, T: Write + 'b> Session<'b, T> {
 
         let manifest = ModuleGraphManifest {
             schema: "ohm.rustfmt-files",
-            version: 5,
+            version: 6,
             unchanged: !self.rewritten_sources,
             roots: graph
                 .roots
@@ -872,7 +872,7 @@ impl<'b, T: Write + 'b> Session<'b, T> {
             path,
             &LeafFormatCertificate {
                 schema: "ohm.rustfmt-leaf",
-                version: if rewritten { 8 } else { 7 },
+                version: if rewritten { 10 } else { 9 },
                 root: &root,
                 leaves: canonical,
             },
@@ -1084,7 +1084,7 @@ mod unit_tests {
             serde_json::from_slice(&fs::read(manifest_path)?).map_err(io::Error::other)?;
 
         assert_eq!(manifest["schema"], "ohm.rustfmt-files");
-        assert_eq!(manifest["version"], 5);
+        assert_eq!(manifest["version"], 6);
         assert_eq!(manifest["unchanged"], true);
         assert_eq!(
             manifest["roots"][0]["path"],
@@ -1271,7 +1271,7 @@ mod unit_tests {
         session.write_leaf_certificates(&certificate_path, &root, &leaves)?;
         let certificate: serde_json::Value =
             serde_json::from_slice(&fs::read(&certificate_path)?).map_err(io::Error::other)?;
-        assert_eq!(certificate["version"], 7);
+        assert_eq!(certificate["version"], 9);
         assert_eq!(certificate["leaves"].as_array().map(Vec::len), Some(2));
 
         let duplicate = vec![(first.clone(), topology.clone()), (first, topology)];
