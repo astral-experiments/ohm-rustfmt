@@ -19,7 +19,7 @@ use super::{
     run_rustfmt_with_output, rustfmt_command,
 };
 
-const CACHE_VERSION: u32 = 16;
+const CACHE_VERSION: u32 = 17;
 const MODULE_MANIFEST_VERSION: u32 = 5;
 const MODULE_MANIFEST_SCHEMA: &str = "ohm.rustfmt-files";
 const MODULE_MANIFEST_ENVIRONMENT: &str = "OHM_RUSTFMT_MODULE_MANIFEST";
@@ -27,8 +27,8 @@ const CHANGED_MODULE_ENVIRONMENT: &str = "OHM_RUSTFMT_CHANGED_MODULE";
 const MODULE_TOPOLOGY_ENVIRONMENT: &str = "OHM_RUSTFMT_MODULE_TOPOLOGY";
 const MODULE_WRITE_ENVIRONMENT: &str = "OHM_RUSTFMT_ALLOW_MODULE_WRITE";
 const LEAF_CERTIFICATE_SCHEMA: &str = "ohm.rustfmt-leaf";
-const LEAF_CERTIFICATE_VERSION: u32 = 5;
-const LEAF_WRITE_CERTIFICATE_VERSION: u32 = 6;
+const LEAF_CERTIFICATE_VERSION: u32 = 7;
+const LEAF_WRITE_CERTIFICATE_VERSION: u32 = 8;
 const ENABLE_ENVIRONMENT: &str = "OHM_INCREMENTAL_FMT";
 const CACHE_ENVIRONMENT: &str = "OHM_INCREMENTAL_FMT_CACHE_DIR";
 const TRACE_ENVIRONMENT: &str = "OHM_INCREMENTAL_FMT_TRACE";
@@ -119,6 +119,7 @@ struct LeafCertificate {
 struct CertifiedLeaf {
     leaf: String,
     topology: String,
+    inputs: crate::path_utils::LeafInputs,
 }
 
 /// Separates an unchanged proof from a write that still needs read-only verification.
@@ -272,9 +273,9 @@ pub(super) fn format(
         return Ok(output.status);
     }
 
-    let leaf_certificate = changed_leaves
-        .as_ref()
-        .and_then(|leaves| read_leaf_certificate(&output.module_manifests, leaves).ok());
+    let leaf_certificate = changed_leaves.as_ref().and_then(|leaves| {
+        read_leaf_certificate(&output.module_manifests, leaves, &plan.current).ok()
+    });
     let rewritten_leaf = leaf_certificate == Some(LeafCertificateKind::Rewritten);
     if let Some(leaves) = changed_leaves.as_ref() {
         if leaf_certificate == Some(LeafCertificateKind::Unchanged) {
@@ -452,7 +453,7 @@ pub(super) fn format(
                 return Ok(output.status);
             }
             let certified_leaves = verification_leaves.as_ref().is_some_and(|leaves| {
-                read_leaf_certificate(&verification.module_manifests, leaves)
+                read_leaf_certificate(&verification.module_manifests, leaves, &updated)
                     .is_ok_and(|kind| kind == LeafCertificateKind::Unchanged)
             });
             if certified_leaves {
@@ -525,6 +526,7 @@ pub(super) fn format(
 fn read_leaf_certificate(
     paths: &[PathBuf],
     selected: &[ChangedLeaf],
+    snapshot: &Snapshot,
 ) -> io::Result<LeafCertificateKind> {
     let [path] = paths else {
         return Err(unsupported(
@@ -548,6 +550,11 @@ fn read_leaf_certificate(
             ));
         }
     };
+    let sources = snapshot
+        .packages
+        .values()
+        .find_map(|package| package.targets.get(&certificate.root))
+        .ok_or_else(|| unsupported("missing snapshot for direct-module certificate"))?;
     if certificate.schema != LEAF_CERTIFICATE_SCHEMA
         || selected.is_empty()
         || selected.iter().any(|leaf| leaf.root != certificate.root)
@@ -558,6 +565,8 @@ fn read_leaf_certificate(
             .zip(selected)
             .any(|(proof, leaf)| {
                 proof.leaf != leaf.path
+                    || sources.get(&leaf.root) != Some(&proof.inputs.root)
+                    || sources.get(&leaf.path) != Some(&proof.inputs.leaf)
                     || proof.topology != leaf.topology
                     || !valid_topology_digest(&proof.topology)
                     || !canonical_module_path(&proof.leaf)
@@ -2433,6 +2442,19 @@ mod tests {
                 })
             })
             .collect::<io::Result<Vec<_>>>()?;
+        let mut snapshot = snapshot(&[]);
+        let mut sources = BTreeMap::from([(root.clone(), fingerprint("root"))]);
+        for leaf in &selected {
+            sources.insert(leaf.path.clone(), fingerprint("leaf"));
+        }
+        snapshot.packages.insert(
+            path_string(directory.path())?,
+            PackageSnapshot {
+                targets: BTreeMap::from([(root.clone(), sources)]),
+                leaves: LeafGraph::new(),
+                probes: ProbeGraph::new(),
+            },
+        );
         let path = directory.path().join("certificate.json");
         for (version, count, expected) in [
             (
@@ -2458,14 +2480,30 @@ mod tests {
                     .map(|leaf| CertifiedLeaf {
                         leaf: leaf.path.clone(),
                         topology: leaf.topology.clone(),
+                        inputs: crate::path_utils::LeafInputs {
+                            root: fingerprint("root"),
+                            leaf: fingerprint("leaf"),
+                        },
                     })
                     .collect(),
             };
             fs::write(&path, serde_json::to_vec(&certificate)?)?;
-            assert_eq!(
-                read_leaf_certificate(std::slice::from_ref(&path), &selected[..count]).ok(),
-                expected
-            );
+            let read = || {
+                read_leaf_certificate(std::slice::from_ref(&path), &selected[..count], &snapshot)
+                    .ok()
+            };
+            assert_eq!(read(), expected);
+            if expected.is_some() {
+                let mut other_root = certificate.clone();
+                other_root.leaves[0].inputs.root = fingerprint("replacement");
+                fs::write(&path, serde_json::to_vec(&other_root)?)?;
+                assert!(read().is_none());
+
+                let mut other_leaf = certificate;
+                other_leaf.leaves[0].inputs.leaf = fingerprint("replacement");
+                fs::write(&path, serde_json::to_vec(&other_leaf)?)?;
+                assert!(read().is_none());
+            }
         }
         Ok(())
     }

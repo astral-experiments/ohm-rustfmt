@@ -37,7 +37,7 @@ pub(crate) struct ParseSess {
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
 pub(crate) struct FileProbe {
     #[serde(skip_serializing_if = "Option::is_none")]
-    fingerprint: Option<crate::path_utils::SourceFingerprint>,
+    pub(crate) fingerprint: Option<crate::path_utils::SourceFingerprint>,
     pub(crate) path: PathBuf,
     pub(crate) canonical: Option<PathBuf>,
     pub(crate) exists: bool,

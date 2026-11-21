@@ -45,6 +45,7 @@ use crate::formatting::{
 use crate::modules::ModuleResolutionError;
 use crate::parse::parser::DirectoryOwnership;
 use crate::parse::session::{FileProbe, ParseSess};
+use crate::path_utils::LeafInputs;
 use crate::shape::Indent;
 use crate::utils::indent_next_line;
 
@@ -450,8 +451,7 @@ pub struct Session<'b, T: Write> {
     source_file: SourceFile,
     emitter: Box<dyn Emitter + 'b>,
     module_graph: Option<ResolvedModuleGraph>,
-    unchanged_leaves: BTreeSet<(PathBuf, PathBuf, String)>,
-    rewritten_leaves: BTreeSet<(PathBuf, PathBuf, String)>,
+    leaf_proofs: BTreeMap<(PathBuf, PathBuf), LeafProof>,
     rewritten_sources: bool,
     emitted_diagnostics: bool,
 }
@@ -489,6 +489,37 @@ struct ModuleGraphRoot<'a> {
     probes: Vec<&'a FileProbe>,
 }
 
+/// Carries the parser's observations through to the direct-module certificate.
+pub(crate) struct DirectModuleReport {
+    report: FormatReport,
+    emitted_diagnostics: bool,
+    probes: Option<Vec<FileProbe>>,
+}
+
+impl DirectModuleReport {
+    /// Finds the parsed versions at the two canonical paths selected for formatting.
+    fn inputs(&self, root: &Path, leaf: &Path) -> Option<LeafInputs> {
+        let probes = self.probes.as_ref()?;
+        let version = |path: &Path| {
+            probes
+                .iter()
+                .find(|probe| probe.canonical.as_deref() == Some(path))?
+                .fingerprint
+        };
+        Some(LeafInputs {
+            root: version(root)?,
+            leaf: version(leaf)?,
+        })
+    }
+}
+
+/// Proof for one root/module pair in this session.
+struct LeafProof {
+    topology: String,
+    inputs: LeafInputs,
+    rewritten: bool,
+}
+
 /// Records an unchanged leaf proof or a leaf write that still requires verification.
 #[derive(serde::Serialize)]
 struct LeafFormatCertificate<'a> {
@@ -500,8 +531,9 @@ struct LeafFormatCertificate<'a> {
 
 #[derive(serde::Serialize)]
 struct CertifiedModule<'a> {
-    leaf: &'a Path,
+    leaf: PathBuf,
     topology: &'a str,
+    inputs: LeafInputs,
 }
 
 /// Rejects unresolved and non-UTF-8 paths that cannot be represented in a cache manifest.
@@ -534,8 +566,7 @@ impl<'b, T: Write + 'b> Session<'b, T> {
             errors: ReportedErrors::default(),
             source_file: SourceFile::new(),
             module_graph: None,
-            unchanged_leaves: BTreeSet::new(),
-            rewritten_leaves: BTreeSet::new(),
+            leaf_proofs: BTreeMap::new(),
             rewritten_sources: false,
             emitted_diagnostics: false,
         }
@@ -544,8 +575,7 @@ impl<'b, T: Write + 'b> Session<'b, T> {
     /// The main entry point for Rustfmt. Formats the given input according to the
     /// session's config.
     pub fn format(&mut self, input: Input) -> Result<FormatReport, ErrorKind> {
-        self.unchanged_leaves.clear();
-        self.rewritten_leaves.clear();
+        self.leaf_proofs.clear();
         self.format_input_inner(input, false)
     }
 
@@ -598,45 +628,35 @@ impl<'b, T: Write + 'b> Session<'b, T> {
         mode: DirectModuleMode,
     ) -> Result<Option<FormatReport>, ErrorKind> {
         let canonical = root.canonicalize().ok().zip(module.canonicalize().ok());
-        for proofs in [&mut self.unchanged_leaves, &mut self.rewritten_leaves] {
-            match canonical.as_ref() {
-                Some((root, module)) => proofs.retain(|(previous_root, previous_module, _)| {
-                    previous_root != root || previous_module != module
-                }),
-                None => proofs.clear(),
-            }
+        if let Some(key) = &canonical {
+            self.leaf_proofs.remove(key);
+        } else {
+            self.leaf_proofs.clear();
         }
         let original = fs::read(module).ok();
-        let report = self.format_leaf_input(root, module, Some(expected_topology), mode)?;
-        if report
-            .as_ref()
-            .is_some_and(|(_, _, emitted_diagnostics)| *emitted_diagnostics)
-        {
+        let Some(result) = self.format_leaf_input(root, module, Some(expected_topology), mode)?
+        else {
+            return Ok(None);
+        };
+        if result.emitted_diagnostics {
             self.record_visible_diagnostics();
-        }
-        if report
-            .as_ref()
-            .is_some_and(|(_, _, emitted_diagnostics)| !emitted_diagnostics)
-            && self.has_no_visible_errors()
-        {
-            if let Some((proof, unchanged)) = root
-                .canonicalize()
-                .ok()
-                .zip(module.canonicalize().ok())
-                .zip(report.as_ref().map(|(_, topology, _)| topology.clone()))
-                .zip(original.zip(fs::read(module).ok()))
-                .map(|(((root, module), topology), (original, result))| {
-                    ((root, module, topology), original == result)
-                })
-            {
-                if unchanged {
-                    self.unchanged_leaves.insert(proof);
-                } else if mode == DirectModuleMode::Rewrite {
-                    self.rewritten_leaves.insert(proof);
+        } else if self.has_no_visible_errors() {
+            let proof = canonical.and_then(|(root, leaf)| {
+                let inputs = result.inputs(&root, &leaf)?;
+                let rewritten = original? != fs::read(module).ok()?;
+                if rewritten && mode != DirectModuleMode::Rewrite {
+                    return None;
                 }
-            }
+                let proof = LeafProof {
+                    topology: expected_topology.to_owned(),
+                    inputs,
+                    rewritten,
+                };
+                Some(((root, leaf), proof))
+            });
+            self.leaf_proofs.extend(proof);
         }
-        Ok(report.map(|(report, _, _)| report))
+        Ok(Some(result.report))
     }
 
     /// Enables opt-in collection of the exact files selected for each input.
@@ -825,16 +845,25 @@ impl<'b, T: Write + 'b> Session<'b, T> {
         let mut rewritten = false;
         for (leaf, topology) in leaves {
             let leaf = leaf.canonicalize()?;
-            let proof = (root.clone(), leaf.clone(), topology.clone());
-            let unchanged = self.unchanged_leaves.contains(&proof);
-            let authorized_write = leaves.len() == 1 && self.rewritten_leaves.contains(&proof);
-            if root == leaf || !unique.insert(leaf.clone()) || !(unchanged || authorized_write) {
+            let proof = self
+                .leaf_proofs
+                .get(&(root.clone(), leaf.clone()))
+                .ok_or_else(|| io::Error::other("no proof for the requested leaf"))?;
+            if root == leaf
+                || !unique.insert(leaf.clone())
+                || proof.topology != *topology
+                || (proof.rewritten && leaves.len() != 1)
+            {
                 return Err(io::Error::other(
                     "the incremental leaf was not proven unchanged or rewritten in isolation",
                 ));
             }
-            rewritten |= authorized_write;
-            canonical.push((leaf, topology));
+            rewritten |= proof.rewritten;
+            canonical.push(CertifiedModule {
+                leaf,
+                topology,
+                inputs: proof.inputs,
+            });
         }
         if canonical.is_empty() {
             return Err(io::Error::other("the incremental leaf batch is empty"));
@@ -843,12 +872,9 @@ impl<'b, T: Write + 'b> Session<'b, T> {
             path,
             &LeafFormatCertificate {
                 schema: "ohm.rustfmt-leaf",
-                version: if rewritten { 6 } else { 5 },
+                version: if rewritten { 8 } else { 7 },
                 root: &root,
-                leaves: canonical
-                    .iter()
-                    .map(|(leaf, topology)| CertifiedModule { leaf, topology })
-                    .collect(),
+                leaves: canonical,
             },
         )
     }
@@ -1245,7 +1271,7 @@ mod unit_tests {
         session.write_leaf_certificates(&certificate_path, &root, &leaves)?;
         let certificate: serde_json::Value =
             serde_json::from_slice(&fs::read(&certificate_path)?).map_err(io::Error::other)?;
-        assert_eq!(certificate["version"], 5);
+        assert_eq!(certificate["version"], 7);
         assert_eq!(certificate["leaves"].as_array().map(Vec::len), Some(2));
 
         let duplicate = vec![(first.clone(), topology.clone()), (first, topology)];
