@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
-use std::io;
+use std::fs;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -86,8 +87,32 @@ impl RecordedFileProbes {
         })
     }
 
+    /// Reads source text and its version from the same handle. A rename can
+    /// change the file at `path` between checking its metadata and opening it.
+    fn read_source(&self, path: &Path) -> io::Result<String> {
+        let invalidate = |_: &io::Error| self.complete.store(false, Ordering::Release);
+        let mut file = fs::File::open(path).inspect_err(invalidate)?;
+        let metadata = file.metadata().ok();
+        // Let rustc enforce its SourceFile size limit and provide the diagnostic.
+        if metadata
+            .as_ref()
+            .is_some_and(|m| m.len() >= u64::from(u32::MAX))
+        {
+            self.complete.store(false, Ordering::Release);
+            return RealFileLoader.read_file(path);
+        }
+        let mut content = String::new();
+        file.read_to_string(&mut content).inspect_err(invalidate)?;
+        if let Some(metadata) = metadata {
+            self.record(path, true, Some(&metadata));
+        } else {
+            self.complete.store(false, Ordering::Release);
+        }
+        Ok(content)
+    }
+
     /// Preserves symlink aliases and negative lookups while rejecting unstable observations.
-    fn record(&self, path: &Path, exists: bool) {
+    fn record(&self, path: &Path, exists: bool, opened: Option<&fs::Metadata>) {
         let path = if path.is_absolute() {
             path.to_path_buf()
         } else {
@@ -97,6 +122,13 @@ impl RecordedFileProbes {
             self.complete.store(false, Ordering::Release);
             return;
         };
+        if let Some(metadata) = opened {
+            let version = crate::path_utils::SourceFingerprint::from_metadata(metadata).ok();
+            if version.is_none() || version != probe.fingerprint {
+                self.complete.store(false, Ordering::Release);
+                return;
+            }
+        }
         match self.probes.lock() {
             Ok(mut probes) => match probes.get(&path) {
                 Some(previous) if previous != &probe => {
@@ -120,17 +152,17 @@ struct RecordingFileLoader {
 impl FileLoader for RecordingFileLoader {
     fn file_exists(&self, path: &Path) -> bool {
         let exists = RealFileLoader.file_exists(path);
-        self.probes.record(path, exists);
+        self.probes.record(path, exists, None);
         exists
     }
 
     fn read_file(&self, path: &Path) -> io::Result<String> {
-        self.probes.record(path, true);
-        RealFileLoader.read_file(path)
+        self.probes.read_source(path)
     }
 
     fn read_binary_file(&self, path: &Path) -> io::Result<Arc<[u8]>> {
-        self.probes.record(path, true);
+        // The binary loader does not expose the version it opened.
+        self.probes.complete.store(false, Ordering::Release);
         RealFileLoader.read_binary_file(path)
     }
 
@@ -285,10 +317,17 @@ impl ParseSess {
         self.raw_psess.source_map().file_exists(path)
     }
 
+    /// Reports whether the parser and any later source reads agreed on each file.
+    pub(crate) fn probes_complete(&self) -> bool {
+        self.file_probes
+            .as_ref()
+            .is_none_or(|recorded| recorded.complete.load(Ordering::Acquire))
+    }
+
     /// Returns native resolution decisions only when every recorded probe stayed consistent.
     pub(crate) fn file_probes(&self) -> Option<Vec<FileProbe>> {
         let recorded = self.file_probes.as_ref()?;
-        if !recorded.complete.load(Ordering::Acquire) {
+        if !self.probes_complete() {
             return None;
         }
         let probes = recorded.probes.lock().ok()?;
@@ -396,6 +435,14 @@ impl ParseSess {
         )
     }
 
+    /// Records reads of unnormalized source text used to compare line endings.
+    pub(crate) fn read_source(&self, path: &Path) -> io::Result<String> {
+        match &self.file_probes {
+            Some(probes) => probes.read_source(path),
+            None => fs::read_to_string(path),
+        }
+    }
+
     pub(crate) fn get_original_snippet(&self, filename: &FileName) -> Option<Arc<String>> {
         let rustc_filename = match filename {
             FileName::Real(path) => rustc_span::FileName::Real(
@@ -467,6 +514,23 @@ mod tests {
     use super::*;
 
     use rustfmt_config_proc_macro::nightly_only_test;
+
+    #[test]
+    fn source_probe_rejects_another_open_file_at_the_same_path() -> std::io::Result<()> {
+        use std::time::{Duration, UNIX_EPOCH};
+
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("source.rs");
+        let source = fs::File::create(&path)?;
+        source.set_modified(UNIX_EPOCH + Duration::from_secs(1_700_000_000))?;
+        let replacement = directory.path().join("replacement");
+        fs::write(&replacement, "fn next( ){}\n")?;
+        fs::rename(&replacement, &path)?;
+        let probes = RecordedFileProbes::new()?;
+        probes.record(&path, true, Some(&source.metadata()?));
+        assert!(!probes.complete.load(Ordering::Acquire));
+        Ok(())
+    }
 
     mod emitter {
         use super::*;
