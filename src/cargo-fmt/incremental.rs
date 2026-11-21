@@ -19,7 +19,7 @@ use super::{
     run_rustfmt_with_output, rustfmt_command,
 };
 
-const CACHE_VERSION: u32 = 15;
+const CACHE_VERSION: u32 = 16;
 const MODULE_MANIFEST_VERSION: u32 = 5;
 const MODULE_MANIFEST_SCHEMA: &str = "ohm.rustfmt-files";
 const MODULE_MANIFEST_ENVIRONMENT: &str = "OHM_RUSTFMT_MODULE_MANIFEST";
@@ -474,7 +474,7 @@ pub(super) fn format(
                         return Ok(output.status);
                     }
                 };
-                if !discovery_matches(&verification_discovery, &modules, &leaves, &probes) {
+                if !discovery_matches(&verification_discovery, &updated) {
                     trace("not caching a module graph changed concurrently with formatting");
                     return Ok(output.status);
                 }
@@ -647,22 +647,27 @@ fn verify_formatted_targets(
     )
 }
 
-/// Rejects verification graphs whose parsed files or logical resolution probes changed.
-fn discovery_matches(
-    discovered: &Discovery,
-    modules: &ModuleGraph,
-    leaves: &LeafGraph,
-    probes: &ProbeGraph,
-) -> bool {
-    discovered.modules.len() == discovered.probes.len()
-        && discovered.modules.len() == discovered.leaves.len()
-        && discovered.modules.iter().all(|(root, files)| {
-            modules
-                .get(root)
-                .is_some_and(|inputs| inputs.keys().eq(files.keys()))
-                && discovered.leaves.get(root) == leaves.get(root)
-                && discovered.probes.get(root) == probes.get(root)
-        })
+/// Checks that the read-only pass saw the versions in the snapshot we plan to
+/// publish. Only the targets selected for verification appear in the discovery.
+fn discovery_matches(discovered: &Discovery, snapshot: &Snapshot) -> bool {
+    let mut verified = 0;
+    for package in snapshot.packages.values() {
+        for (root, sources) in &package.targets {
+            let Some(files) = discovered.modules.get(root) else {
+                continue;
+            };
+            if files != sources
+                || discovered.leaves.get(root) != package.leaves.get(root)
+                || discovered.probes.get(root) != package.probes.get(root)
+            {
+                return false;
+            }
+            verified += 1;
+        }
+    }
+    verified == discovered.modules.len()
+        && verified == discovered.leaves.len()
+        && verified == discovered.probes.len()
 }
 
 /// Detects newly discovered modules that also belong to a previously unselected target.
@@ -2906,66 +2911,46 @@ mod tests {
 
     #[test]
     fn verification_rejects_concurrently_changed_module_and_probe_graphs() {
-        let root = String::from("/workspace/first/src/lib.rs");
-        let module = String::from("/workspace/first/src/nested.rs");
-        let modules = ModuleGraph::from([(
-            root.clone(),
-            BTreeMap::from([
-                (root.clone(), fingerprint("root")),
-                (module.clone(), fingerprint("module")),
-            ]),
+        let root = "/workspace/first/src/lib.rs";
+        let module = "/workspace/first/src/nested.rs";
+        let checked = snapshot(&[(
+            "/workspace/first",
+            &[("src/lib.rs", "root"), ("src/nested.rs", "module")],
         )]);
-        let probes = ProbeGraph::from([(
-            root.clone(),
-            BTreeMap::from([(
-                module.clone(),
-                ProbeObservation {
-                    canonical: Some(module.clone()),
-                    exists: true,
-                    is_directory: false,
-                },
-            )]),
-        )]);
-        let discovery = Discovery {
-            modules: modules.clone(),
-            leaves: LeafGraph::from([(root.clone(), BTreeMap::new())]),
-            probes: probes.clone(),
+        let mut discovery = Discovery {
+            modules: checked.module_graph(),
+            leaves: checked.leaf_graph(),
+            probes: checked.probe_graph(),
             unchanged: true,
         };
-        let leaves = discovery.leaves.clone();
-        assert!(discovery_matches(&discovery, &modules, &leaves, &probes));
+        assert!(discovery_matches(&discovery, &checked));
+
+        // Verification read a temporary replacement for a known module.
+        let mut other_version = discovery.clone();
+        other_version
+            .modules
+            .get_mut(root)
+            .unwrap()
+            .insert(module.to_owned(), fingerprint("replacement"));
+        assert!(!discovery_matches(&other_version, &checked));
 
         let mut changed_modules = discovery.clone();
-        if let Some(files) = changed_modules.modules.get_mut(&root) {
-            files.insert(
-                String::from("/workspace/first/src/replacement.rs"),
-                fingerprint("replacement"),
-            );
-        }
-        assert!(!discovery_matches(
-            &changed_modules,
-            &modules,
-            &leaves,
-            &probes
-        ));
+        changed_modules
+            .modules
+            .get_mut(root)
+            .unwrap()
+            .remove(module);
+        assert!(!discovery_matches(&changed_modules, &checked));
 
-        let mut changed_probes = discovery;
-        if let Some(observations) = changed_probes.probes.get_mut(&root) {
-            observations.insert(
-                String::from("/workspace/first/src/replacement.rs"),
-                ProbeObservation {
-                    canonical: None,
-                    exists: false,
-                    is_directory: false,
-                },
-            );
-        }
-        assert!(!discovery_matches(
-            &changed_probes,
-            &modules,
-            &leaves,
-            &probes
-        ));
+        discovery.probes.get_mut(root).unwrap().insert(
+            String::from("/workspace/first/src/replacement.rs"),
+            ProbeObservation {
+                canonical: None,
+                exists: false,
+                is_directory: false,
+            },
+        );
+        assert!(!discovery_matches(&discovery, &checked));
     }
 
     #[test]
