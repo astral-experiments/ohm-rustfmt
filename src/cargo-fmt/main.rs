@@ -185,6 +185,7 @@ fn rustfmt_command() -> Command {
     let mut command = Command::new(rustfmt);
     for variable in [
         "OHM_RUSTFMT_MODULE_MANIFEST",
+        "OHM_RUSTFMT_EXPECTED_CONFIGURATION",
         "OHM_RUSTFMT_CHANGED_MODULE",
         "OHM_RUSTFMT_MODULE_TOPOLOGY",
         "OHM_RUSTFMT_ALLOW_MODULE_WRITE",
@@ -577,7 +578,7 @@ fn run_rustfmt_with_output(
     fmt_args: &[String],
     verbosity: Verbosity,
     output_mode: RustfmtOutputMode,
-    manifest_directory: Option<&Path>,
+    manifest_inputs: Option<(&Path, &incremental::Snapshot)>,
     changed_modules: Option<&[(PathBuf, String)]>,
 ) -> Result<RustfmtOutput, io::Error> {
     let by_edition = targets
@@ -614,11 +615,11 @@ fn run_rustfmt_with_output(
         let mut command = rustfmt_command();
         command
             .stdout(stdout)
-            .args(files)
+            .args(&files)
             .args(["--edition", edition.as_str()])
             .args(fmt_args);
 
-        if let Some(directory) = manifest_directory {
+        if let Some((directory, snapshot)) = manifest_inputs {
             let manifest = directory.join(format!(
                 ".modules-{}-{}.json",
                 std::process::id(),
@@ -630,6 +631,10 @@ fn run_rustfmt_with_output(
                 Err(error) => return Err(error),
             }
             command.env("OHM_RUSTFMT_MODULE_MANIFEST", &manifest);
+            command.env(
+                "OHM_RUSTFMT_EXPECTED_CONFIGURATION",
+                snapshot.configuration_digest(&files, fmt_args),
+            );
             module_manifests.push(manifest);
         }
         if let Some(modules) = changed_modules {
@@ -646,7 +651,7 @@ fn run_rustfmt_with_output(
                 command.env(MODULE_WRITE_ENVIRONMENT, "1");
             }
         }
-        if manifest_directory.is_some() || output_mode != RustfmtOutputMode::Inherit {
+        if manifest_inputs.is_some() || output_mode != RustfmtOutputMode::Inherit {
             command.stderr(std::process::Stdio::piped());
         }
 
