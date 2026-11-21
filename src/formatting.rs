@@ -139,10 +139,11 @@ fn format_leaf_project<T: FormatHandler>(
     }
 
     context.psess.set_silent_emitter();
-    if !context.format_file(leaf_file, &module, false, Some(mode))? {
+    let Some(action) = context.format_file(leaf_file, &module, false, Some(mode))? else {
         return Ok(None);
-    }
+    };
     Ok(Some(crate::DirectModuleReport {
+        rewritten: action == DirectModuleMode::Rewrite,
         emitted_diagnostics: context.psess.emitted_diagnostics(),
         probes: context.psess.file_probes(),
         report: context.report,
@@ -383,14 +384,14 @@ impl<'a, T: FormatHandler + 'a> FormatContext<'a, T> {
         self.psess.ignore_file(path)
     }
 
-    // Formats a single file/module.
+    /// Formats a file and returns the action taken for an accepted direct module.
     fn format_file(
         &mut self,
         path: FileName,
         module: &Module<'_>,
         is_macro_def: bool,
-        direct_mode: Option<DirectModuleMode>,
-    ) -> Result<bool, ErrorKind> {
+        mut direct_mode: Option<DirectModuleMode>,
+    ) -> Result<Option<DirectModuleMode>, ErrorKind> {
         let snippet_provider = self.psess.snippet_provider(module.span);
         let mut visitor = FmtVisitor::from_psess(
             &self.psess,
@@ -462,7 +463,10 @@ impl<'a, T: FormatHandler + 'a> FormatContext<'a, T> {
                 || self.psess.emitted_diagnostics()
                 || (mode == DirectModuleMode::Unchanged && !unchanged)
             {
-                return Ok(false);
+                return Ok(None);
+            }
+            if unchanged {
+                direct_mode = Some(DirectModuleMode::Unchanged);
             }
         }
 
@@ -478,7 +482,7 @@ impl<'a, T: FormatHandler + 'a> FormatContext<'a, T> {
             visitor.buffer.to_owned(),
             &mut self.report,
         )?;
-        Ok(true)
+        Ok(direct_mode)
     }
 }
 
