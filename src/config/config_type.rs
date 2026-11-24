@@ -83,6 +83,7 @@ macro_rules! create_config {
         #[derive(Clone)]
         #[allow(unreachable_pub)]
         pub struct Config {
+            file_identity: String,
             // For each config item, we store:
             //
             // - 0: true if the value has been access
@@ -210,6 +211,7 @@ macro_rules! create_config {
             #[allow(unreachable_pub)]
             pub(super) fn default_with_style_edition(style_edition: StyleEdition) -> Config {
                 Config {
+                    file_identity: String::new(),
                     $(
                         $i: (
                                 Cell::new(false),

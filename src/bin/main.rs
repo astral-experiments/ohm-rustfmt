@@ -16,6 +16,7 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 use getopts::{Matches, Options};
+use sha2::{Digest, Sha256};
 
 use crate::rustfmt::{
     CliOptions, Color, Config, Edition, EmitMode, FileLines, FileName,
@@ -359,6 +360,8 @@ fn format(
         });
     let allow_module_write = env::var(MODULE_WRITE_ENVIRONMENT).is_ok_and(|value| value == "1");
     let mut certified_leaves = None;
+    let expected_config = env::var("OHM_RUSTFMT_EXPECTED_CONFIGURATION").ok();
+    let mut config_digest = Sha256::new();
     if module_manifest.is_some() {
         session.enable_module_graph();
     }
@@ -385,6 +388,9 @@ fn format(
                     }
                 }
 
+                if expected_config.is_some() {
+                    local_config.hash_file_identity(&mut config_digest);
+                }
                 certified_leaves = session.override_config(local_config, |session| {
                     format_targets(
                         session,
@@ -394,6 +400,9 @@ fn format(
                     )
                 });
             } else {
+                if expected_config.is_some() {
+                    session.config.hash_file_identity(&mut config_digest);
+                }
                 certified_leaves = format_targets(
                     &mut session,
                     file,
@@ -421,6 +430,11 @@ fn format(
         0
     };
     if let (0, Some(path), Some(roots)) = (exit_code, module_manifest, expected_roots) {
+        if expected_config
+            .is_some_and(|expected| expected != format!("{:x}", config_digest.finalize()))
+        {
+            return Ok(exit_code);
+        }
         // Missing or unwritable manifests make consumers fall back to complete
         // formatting. They must never change rustfmt's diagnostics or status.
         // Some macro rewrites intentionally fail silently without affecting

@@ -335,8 +335,24 @@ impl Config {
         let mut file = File::open(&file_path)?;
         let mut toml = String::new();
         file.read_to_string(&mut toml)?;
-        Config::from_toml_for_style_edition(&toml, file_path, edition, style_edition, version)
-            .map_err(|err| Error::new(ErrorKind::InvalidData, err))
+        let mut config =
+            Config::from_toml_for_style_edition(&toml, file_path, edition, style_edition, version)
+                .map_err(|err| Error::new(ErrorKind::InvalidData, err))?;
+        if env::var_os("OHM_RUSTFMT_EXPECTED_CONFIGURATION").is_some() {
+            use sha2::{Digest, Sha256};
+            config.file_identity = format!(
+                "{}:{:x}",
+                file_path.display(),
+                Sha256::digest(toml.as_bytes())
+            );
+        }
+        Ok(config)
+    }
+
+    /// Adds the configuration actually parsed for this root to the formatter's proof.
+    #[doc(hidden)]
+    pub fn hash_file_identity(&self, digest: &mut sha2::Sha256) {
+        crate::path_utils::hash_configuration(digest, &self.file_identity);
     }
 
     /// Resolves the config for input in `dir`.
@@ -354,50 +370,20 @@ impl Config {
         style_edition: Option<StyleEdition>,
         version: Option<Version>,
     ) -> Result<(Config, Option<PathBuf>), Error> {
-        /// Try to find a project file in the given directory and its parents.
-        /// Returns the path of the nearest project file if one exists,
-        /// or `None` if no project file was found.
-        fn resolve_project_file(dir: &Path) -> Result<Option<PathBuf>, Error> {
-            let mut current = if dir.is_relative() {
-                env::current_dir()?.join(dir)
-            } else {
-                dir.to_path_buf()
-            };
-
-            current = fs::canonicalize(current)?;
-
-            loop {
-                match get_toml_path(&current) {
-                    Ok(Some(path)) => return Ok(Some(path)),
-                    Err(e) => return Err(e),
-                    _ => (),
-                }
-
-                // If the current directory has no parent, we're done searching.
-                if !current.pop() {
-                    break;
-                }
+        let directory = if dir.is_relative() {
+            env::current_dir()?.join(dir)
+        } else {
+            dir.to_path_buf()
+        };
+        let directory = fs::canonicalize(directory)?;
+        let mut selected = None;
+        for candidate in crate::path_utils::configuration_directories(&directory) {
+            if let Some(path) = get_toml_path(&candidate)? {
+                selected = Some(path);
+                break;
             }
-
-            // If nothing was found, check in the home directory.
-            if let Some(home_dir) = dirs::home_dir() {
-                if let Some(path) = get_toml_path(&home_dir)? {
-                    return Ok(Some(path));
-                }
-            }
-
-            // If none was found there either, check in the user's configuration directory.
-            if let Some(mut config_dir) = dirs::config_dir() {
-                config_dir.push("rustfmt");
-                if let Some(path) = get_toml_path(&config_dir)? {
-                    return Ok(Some(path));
-                }
-            }
-
-            Ok(None)
         }
-
-        match resolve_project_file(dir)? {
+        match selected {
             None => Ok((
                 Config::default_for_possible_style_edition(style_edition, edition, version),
                 None,
@@ -495,8 +481,7 @@ pub fn load_config<O: CliOptions>(
 //
 // Return the path if a config file exists, empty if no file exists, and Error for IO errors
 fn get_toml_path(dir: &Path) -> Result<Option<PathBuf>, Error> {
-    const CONFIG_FILE_NAMES: [&str; 2] = [".rustfmt.toml", "rustfmt.toml"];
-    for config_file_name in &CONFIG_FILE_NAMES {
+    for config_file_name in &crate::path_utils::CONFIG_FILE_NAMES {
         let config_file = dir.join(config_file_name);
         match fs::metadata(&config_file) {
             // Only return if it's a file to handle the unlikely situation of a directory named

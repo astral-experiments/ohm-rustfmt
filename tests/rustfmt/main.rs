@@ -403,6 +403,37 @@ fn incremental_rewritten_module_also_formats_its_root_and_siblings() -> std::io:
 }
 
 #[test]
+fn module_manifest_requires_the_expected_config_contents() -> std::io::Result<()> {
+    use sha2::{Digest, Sha256};
+
+    let directory = tempfile::tempdir()?;
+    let root = directory.path().join("lib.rs");
+    let config = directory.path().join("rustfmt.toml");
+    let manifest = directory.path().join("modules.json");
+    fs::write(&root, "fn example() -> i32 {\n    42\n}\n")?;
+    fs::write(&config, "tab_spaces = 2\n")?;
+    let identity = format!(
+        "{}:{:x}\0",
+        config.canonicalize()?.display(),
+        Sha256::digest(fs::read(&config)?)
+    );
+    let expected = format!("{:x}", Sha256::digest(identity.as_bytes()));
+
+    // The source checks clean with four spaces, but cargo-fmt planned the
+    // invocation while the configuration specified two.
+    fs::write(&config, "tab_spaces = 4\n")?;
+    let output = Command::new(env!("CARGO_BIN_EXE_rustfmt"))
+        .arg(&root)
+        .arg("--check")
+        .env("OHM_RUSTFMT_EXPECTED_CONFIGURATION", expected)
+        .env("OHM_RUSTFMT_MODULE_MANIFEST", &manifest)
+        .output()?;
+    assert!(output.status.success());
+    assert!(!manifest.exists());
+    Ok(())
+}
+
+#[test]
 fn authorized_leaf_write_requires_a_separate_unchanged_certificate() -> std::io::Result<()> {
     let directory = tempfile::tempdir()?;
     let directory = directory.path().canonicalize()?;
@@ -429,14 +460,14 @@ fn authorized_leaf_write_requires_a_separate_unchanged_certificate() -> std::io:
     let certificate = root.with_extension("modules.json");
     let written: serde_json::Value = serde_json::from_slice(&fs::read(&certificate)?)?;
     assert_eq!(written["schema"], "ohm.rustfmt-leaf");
-    assert_eq!(written["version"], 4);
+    assert_eq!(written["version"], 6);
 
     fs::remove_file(&certificate)?;
     let verified = rustfmt_with_incremental_leaf(&root, &leaf)?;
     assert!(verified.status.success());
     let unchanged: serde_json::Value = serde_json::from_slice(&fs::read(&certificate)?)?;
     assert_eq!(unchanged["schema"], "ohm.rustfmt-leaf");
-    assert_eq!(unchanged["version"], 3);
+    assert_eq!(unchanged["version"], 5);
     assert_eq!(fs::read(&leaf)?, expected);
     Ok(())
 }
