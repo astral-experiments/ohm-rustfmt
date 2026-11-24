@@ -460,14 +460,14 @@ fn authorized_leaf_write_requires_a_separate_unchanged_certificate() -> std::io:
     let certificate = root.with_extension("modules.json");
     let written: serde_json::Value = serde_json::from_slice(&fs::read(&certificate)?)?;
     assert_eq!(written["schema"], "ohm.rustfmt-leaf");
-    assert_eq!(written["version"], 6);
+    assert_eq!(written["version"], 8);
 
     fs::remove_file(&certificate)?;
     let verified = rustfmt_with_incremental_leaf(&root, &leaf)?;
     assert!(verified.status.success());
     let unchanged: serde_json::Value = serde_json::from_slice(&fs::read(&certificate)?)?;
     assert_eq!(unchanged["schema"], "ohm.rustfmt-leaf");
-    assert_eq!(unchanged["version"], 5);
+    assert_eq!(unchanged["version"], 7);
     assert_eq!(fs::read(&leaf)?, expected);
     Ok(())
 }

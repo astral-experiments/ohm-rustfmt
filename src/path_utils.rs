@@ -30,6 +30,14 @@ pub(crate) fn hash_configuration(digest: &mut sha2::Sha256, identity: &str) {
     digest.update([0]);
 }
 
+/// Source versions used to format a direct module in its real crate-root context.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct LeafInputs {
+    pub(crate) root: SourceFingerprint,
+    pub(crate) leaf: SourceFingerprint,
+}
+
 /// Mirrors Ruff's source identity without reading the contents of cached files.
 ///
 /// Like Ruff, this deliberately trusts filesystem modification timestamps. An

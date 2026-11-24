@@ -73,7 +73,7 @@ impl<'b, T: Write + 'b> Session<'b, T> {
         leaf: &Path,
         expected_topology: Option<&str>,
         mode: DirectModuleMode,
-    ) -> Result<Option<(FormatReport, String, bool)>, ErrorKind> {
+    ) -> Result<Option<crate::DirectModuleReport>, ErrorKind> {
         if !self.config.version_meets_requirement() {
             return Err(ErrorKind::VersionMismatch);
         }
@@ -85,8 +85,8 @@ impl<'b, T: Write + 'b> Session<'b, T> {
             let configuration = self.config.clone();
             let report =
                 format_leaf_project(root, leaf, expected_topology, mode, &configuration, self)?;
-            if let Some((report, _, _)) = report.as_ref() {
-                self.errors.add(&report.internal.borrow().1);
+            if let Some(result) = report.as_ref() {
+                self.errors.add(&result.report.internal.borrow().1);
             }
             Ok(report)
         })
@@ -101,12 +101,12 @@ fn format_leaf_project<T: FormatHandler>(
     mode: DirectModuleMode,
     config: &Config,
     handler: &mut T,
-) -> Result<Option<(FormatReport, String, bool)>, ErrorKind> {
+) -> Result<Option<crate::DirectModuleReport>, ErrorKind> {
     // Keep speculative diagnostics silent until ownership is known. Reuse the
     // accepted parse so clean leaves do not need a second root/module parse.
     let mut configuration = config.clone();
     configuration.set().show_parse_errors(false);
-    let psess = ParseSess::new(&configuration, false)?;
+    let psess = ParseSess::new(&configuration, true)?;
     let Ok(krate) = Parser::parse_crate(Input::File(root.to_owned()), &psess) else {
         return Ok(None);
     };
@@ -143,8 +143,11 @@ fn format_leaf_project<T: FormatHandler>(
     if !context.format_file(leaf_file, &module, false, Some(mode))? {
         return Ok(None);
     }
-    let emitted_diagnostics = context.psess.emitted_diagnostics();
-    Ok(Some((context.report, topology, emitted_diagnostics)))
+    Ok(Some(crate::DirectModuleReport {
+        emitted_diagnostics: context.psess.emitted_diagnostics(),
+        probes: context.psess.file_probes(),
+        report: context.report,
+    }))
 }
 
 /// Requires an unannotated direct declaration with ordinary, unambiguous ownership.
