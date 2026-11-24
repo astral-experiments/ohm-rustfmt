@@ -2,7 +2,6 @@
 
 use std::borrow::Cow;
 use std::collections::HashMap;
-use std::fs;
 use std::io::{self, Write};
 use std::ops::Range;
 use std::path::Path;
@@ -453,9 +452,10 @@ impl<'a, T: FormatHandler + 'a> FormatContext<'a, T> {
                 None
             }
             .unwrap_or_else(|| match &path {
-                FileName::Real(path) => {
-                    fs::read_to_string(path).is_ok_and(|original| original == visitor.buffer)
-                }
+                FileName::Real(path) => self
+                    .psess
+                    .read_source(path)
+                    .is_ok_and(|original| original == visitor.buffer),
                 FileName::Stdin => false,
             });
             if has_visible_errors
@@ -558,6 +558,10 @@ impl<'b, T: Write + 'b> FormatHandler for Session<'b, T> {
                     return Err(io::Error::new(e.kind(), err_msg).into());
                 }
                 _ => {}
+            }
+            // Comparing line endings may read a source again after we recorded the graph.
+            if !psess.probes_complete() {
+                self.module_graph = None;
             }
             self.rewritten_sources |= !unchanged;
         }
