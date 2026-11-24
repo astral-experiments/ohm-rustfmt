@@ -492,6 +492,7 @@ struct ModuleGraphRoot<'a> {
 /// Carries the parser's observations through to the direct-module certificate.
 pub(crate) struct DirectModuleReport {
     report: FormatReport,
+    rewritten: bool,
     emitted_diagnostics: bool,
     probes: Option<Vec<FileProbe>>,
 }
@@ -633,7 +634,6 @@ impl<'b, T: Write + 'b> Session<'b, T> {
         } else {
             self.leaf_proofs.clear();
         }
-        let original = fs::read(module).ok();
         let Some(result) = self.format_leaf_input(root, module, Some(expected_topology), mode)?
         else {
             return Ok(None);
@@ -643,14 +643,10 @@ impl<'b, T: Write + 'b> Session<'b, T> {
         } else if self.has_no_visible_errors() {
             let proof = canonical.and_then(|(root, leaf)| {
                 let inputs = result.inputs(&root, &leaf)?;
-                let rewritten = original? != fs::read(module).ok()?;
-                if rewritten && mode != DirectModuleMode::Rewrite {
-                    return None;
-                }
                 let proof = LeafProof {
                     topology: expected_topology.to_owned(),
                     inputs,
-                    rewritten,
+                    rewritten: result.rewritten,
                 };
                 Some(((root, leaf), proof))
             });
@@ -872,7 +868,7 @@ impl<'b, T: Write + 'b> Session<'b, T> {
             path,
             &LeafFormatCertificate {
                 schema: "ohm.rustfmt-leaf",
-                version: if rewritten { 10 } else { 9 },
+                version: if rewritten { 12 } else { 11 },
                 root: &root,
                 leaves: canonical,
             },
@@ -1243,6 +1239,30 @@ mod unit_tests {
     }
 
     #[test]
+    fn unwritten_leaf_changes_need_verification() -> io::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let root = directory.path().join("lib.rs");
+        let leaf = directory.path().join("child.rs");
+        let certificate = directory.path().join("certificate.json");
+        let topology = modules::empty_module_topology();
+        fs::write(&root, "mod child;\n")?;
+        fs::write(&leaf, "fn f( ){}\n")?;
+
+        // Suppressing emission reproduces a write to a file that was replaced
+        // while rustfmt had it open. The original path still contains the input.
+        let mut config = Config::default();
+        config.set().emit_mode(EmitMode::Files);
+        let mut session = Session::<Vec<u8>>::new(config, None);
+        session
+            .format_module_with_write(&root, &leaf, &topology)
+            .map_err(io::Error::other)?;
+        session.write_leaf_certificate(&certificate, &root, &leaf, &topology)?;
+        let pending: serde_json::Value = serde_json::from_slice(&fs::read(certificate)?)?;
+        assert_eq!(pending["version"], 12);
+        Ok(())
+    }
+
+    #[test]
     fn multiple_certified_leaves_require_independent_proofs() -> io::Result<()> {
         let directory = tempfile::tempdir()?;
         let root = directory.path().join("lib.rs");
@@ -1271,7 +1291,7 @@ mod unit_tests {
         session.write_leaf_certificates(&certificate_path, &root, &leaves)?;
         let certificate: serde_json::Value =
             serde_json::from_slice(&fs::read(&certificate_path)?).map_err(io::Error::other)?;
-        assert_eq!(certificate["version"], 9);
+        assert_eq!(certificate["version"], 11);
         assert_eq!(certificate["leaves"].as_array().map(Vec::len), Some(2));
 
         let duplicate = vec![(first.clone(), topology.clone()), (first, topology)];
