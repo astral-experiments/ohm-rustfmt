@@ -36,10 +36,38 @@ pub(crate) struct ParseSess {
 /// One filesystem observation made by rustfmt's real module resolver.
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
 pub(crate) struct FileProbe {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    fingerprint: Option<crate::path_utils::SourceFingerprint>,
     pub(crate) path: PathBuf,
     pub(crate) canonical: Option<PathBuf>,
     pub(crate) exists: bool,
     pub(crate) is_directory: bool,
+}
+
+impl FileProbe {
+    /// Captures the version about to be read, including files unknown to the previous snapshot.
+    pub(crate) fn observe(path: &Path, exists: bool) -> Option<Self> {
+        path.to_str()?;
+        let (canonical, metadata) = if exists {
+            let (canonical, metadata) = crate::path_utils::canonicalize_with_metadata(path).ok()?;
+            canonical.to_str()?;
+            (Some(canonical), Some(metadata))
+        } else {
+            (None, None)
+        };
+        Some(Self {
+            path: path.to_owned(),
+            canonical,
+            exists,
+            is_directory: metadata.as_ref().is_some_and(|metadata| metadata.is_dir()),
+            fingerprint: metadata
+                .as_ref()
+                .filter(|metadata| metadata.is_file())
+                .and_then(|metadata| {
+                    crate::path_utils::SourceFingerprint::from_metadata(metadata).ok()
+                }),
+        })
+    }
 }
 
 /// Collects logical parser paths and invalidates the graph when observations disagree.
@@ -65,27 +93,9 @@ impl RecordedFileProbes {
         } else {
             self.current_directory.join(path)
         };
-        if path.to_str().is_none() {
+        let Some(probe) = FileProbe::observe(&path, exists) else {
             self.complete.store(false, Ordering::Release);
             return;
-        }
-
-        let canonical = if exists {
-            match crate::path_utils::canonicalize(&path) {
-                Ok(canonical) if canonical.to_str().is_some() => Some(canonical),
-                _ => {
-                    self.complete.store(false, Ordering::Release);
-                    return;
-                }
-            }
-        } else {
-            None
-        };
-        let probe = FileProbe {
-            path: path.clone(),
-            canonical,
-            exists,
-            is_directory: exists && path.is_dir(),
         };
         match self.probes.lock() {
             Ok(mut probes) => match probes.get(&path) {
@@ -115,15 +125,13 @@ impl FileLoader for RecordingFileLoader {
     }
 
     fn read_file(&self, path: &Path) -> io::Result<String> {
-        let contents = RealFileLoader.read_file(path)?;
         self.probes.record(path, true);
-        Ok(contents)
+        RealFileLoader.read_file(path)
     }
 
     fn read_binary_file(&self, path: &Path) -> io::Result<Arc<[u8]>> {
-        let contents = RealFileLoader.read_binary_file(path)?;
         self.probes.record(path, true);
-        Ok(contents)
+        RealFileLoader.read_binary_file(path)
     }
 
     fn current_directory(&self) -> io::Result<PathBuf> {
