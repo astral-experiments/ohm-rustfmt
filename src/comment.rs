@@ -1148,6 +1148,16 @@ pub(crate) trait FindUncommented {
 
 impl FindUncommented for str {
     fn find_uncommented(&self, pat: &str) -> Option<usize> {
+        // A single UTF-8 byte is ASCII. Before the first slash, the
+        // classifier can only return normal or string characters, both
+        // of which match. Scan from the start as usual if a slash wins.
+        if let [needle] = pat.as_bytes() {
+            let i = memchr::memchr2(*needle, b'/', self.as_bytes())?;
+            if self.as_bytes()[i] != b'/' {
+                return Some(i);
+            }
+        }
+
         let mut needle_iter = pat.chars();
         for (kind, (i, b)) in CharClasses::new(self.char_indices()) {
             match needle_iter.next() {
@@ -1778,7 +1788,13 @@ pub(crate) fn recover_comment_removed(
     }
 }
 
-pub(crate) fn filter_normal_code(code: &str) -> String {
+pub(crate) fn filter_normal_code(code: &str) -> Cow<'_, str> {
+    // A comment needs a slash, and LineClasses strips trailing carriage returns.
+    // Without either byte, filtering reproduces the original snippet exactly.
+    if memchr::memchr2(b'/', b'\r', code.as_bytes()).is_none() {
+        return Cow::Borrowed(code);
+    }
+
     let mut buffer = String::with_capacity(code.len());
     LineClasses::new(code).for_each(|(kind, line)| match kind {
         FullCodeCharKind::Normal
@@ -1793,7 +1809,7 @@ pub(crate) fn filter_normal_code(code: &str) -> String {
     if !code.ends_with('\n') && buffer.ends_with('\n') {
         buffer.pop();
     }
-    buffer
+    Cow::Owned(buffer)
 }
 
 /// Returns `true` if the two strings of code have the same payload of comments.
@@ -2098,6 +2114,12 @@ mod test {
         );
         check("sup // sup", "p", Some(2));
         check("sup", "x", None);
+        check("π( /* ) */", "(", Some(2));
+        check("/* ( */π(", "(", Some(9));
+        check(r#""(" // )"#, "(", Some(1));
+        check(r#""/(" // )"#, "(", Some(2));
+        check("/* / */ /", "/", Some(8));
+        check("aab", "ab", None);
         check(r#"π? /**/ π is nice!"#, r#"π is nice"#, Some(9));
         check("/*sup yo? \n sup*/ sup", "p", Some(20));
         check("hel/*lohello*/lo", "hello", None);
@@ -2108,6 +2130,16 @@ mod test {
         check("/**/abc/* */", "abc", Some(4));
         check("\"/* abc */\"", "abc", Some(4));
         check("\"/* abc", "abc", Some(4));
+    }
+
+    #[test]
+    fn filter_preserves_uncommented_lines_and_normalizes_carriage_returns() {
+        for code in ["", "\n", "let x = 1;\n\n", "r#\"一\n二\"#"] {
+            assert!(matches!(filter_normal_code(code), Cow::Borrowed(s) if s == code));
+        }
+        assert_eq!(filter_normal_code("x\r\ny\r"), "x\ny");
+        assert_eq!(filter_normal_code("x / y"), "x / y");
+        assert_eq!(filter_normal_code("// comment\nx"), "x");
     }
 
     #[test]
