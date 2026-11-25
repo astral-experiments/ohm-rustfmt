@@ -109,11 +109,21 @@ pub(crate) fn canonicalize_with_metadata(path: &Path) -> io::Result<(PathBuf, Me
 pub(crate) fn canonicalize_with_handle(path: &Path) -> io::Result<(PathBuf, Option<File>)> {
     #[cfg(target_os = "linux")]
     {
-        use std::path::Component;
+        use std::os::unix::ffi::OsStrExt;
 
         use rustix::fs::{CWD, Mode, OFlags, ResolveFlags, openat2};
 
-        if path.is_absolute() && !path.components().any(|part| part == Component::ParentDir) {
+        if let Some(tail) = path.as_os_str().as_bytes().strip_prefix(b"/") {
+            // On Linux only dots and redundant separators need normalization.
+            // Keep parent traversal on the standard resolution path.
+            let mut normalized = true;
+            for part in tail.split(|&byte| byte == b'/') {
+                match part {
+                    b".." => return path.canonicalize().map(|canonical| (canonical, None)),
+                    b"" | b"." => normalized = false,
+                    _ => {}
+                }
+            }
             if let Ok(handle) = openat2(
                 CWD,
                 path,
@@ -121,7 +131,12 @@ pub(crate) fn canonicalize_with_handle(path: &Path) -> io::Result<(PathBuf, Opti
                 Mode::empty(),
                 ResolveFlags::NO_SYMLINKS,
             ) {
-                return Ok((path.components().collect(), Some(File::from(handle))));
+                let canonical = if normalized {
+                    path.to_owned()
+                } else {
+                    path.components().collect()
+                };
+                return Ok((canonical, Some(File::from(handle))));
             }
         }
     }
@@ -145,6 +160,8 @@ mod tests {
             root.clone(),
             root.join("file.rs"),
             root.join("nested/./"),
+            root.join("nested//"),
+            root.join("./file.rs"),
             root.join("nested/../file.rs"),
             root.join("nested//../file.rs"),
             root.join("missing.rs"),
@@ -156,7 +173,7 @@ mod tests {
                 Ok(expected) => {
                     assert_eq!(canonicalize(&path)?, expected, "{path:?}");
                     let (canonical, handle) = canonicalize_with_handle(&path)?;
-                    assert_eq!(canonical, expected, "{path:?}");
+                    assert_eq!(canonical.as_os_str(), expected.as_os_str(), "{path:?}");
                     if let Some(handle) = handle {
                         let observed = handle.metadata()?;
                         let expected = fs::metadata(&expected)?;
