@@ -333,40 +333,86 @@ fn trusted_formatter_tools(
     Ok((tools, compiler_libraries))
 }
 
+/// Creates a 2021 library and a 2024 binary that can format the same module.
 #[cfg(unix)]
-#[test]
-fn formatting_a_new_hard_link_preserves_edition_order() -> std::io::Result<()> {
-    let directory = tempfile::tempdir()?;
-    let package = directory.path().canonicalize()?;
-    let (tools, compiler_libraries) = trusted_formatter_tools(&package)?;
+fn shared_module_formatter(package: &Path) -> std::io::Result<Command> {
+    let (tools, compiler_libraries) = trusted_formatter_tools(package)?;
     fs::write(
         package.join("Cargo.toml"),
         "[package]\nname = 'mixed'\nversion = '0.1.0'\nedition = '2021'\n\
          [lib]\npath = 'lib.rs'\n\
          [[bin]]\nname = 'mixed'\npath = 'main.rs'\nedition = '2024'\n",
     )?;
-    let library = package.join("lib.rs");
-    let shared = package.join("shared.rs");
+    fs::write(package.join("lib.rs"), "pub struct A;\n")?;
     fs::write(package.join("main.rs"), "mod shared;\nfn main() {}\n")?;
     // Rust 2021 expands the if-expression. Rust 2024 formats it last and keeps it on one line.
     let expected = "pub fn pick(x: bool) -> u8 {\n    if x { 1 } else { 2 }\n}\n";
-    fs::write(&shared, expected)?;
-    fs::hard_link(&shared, package.join("alias.rs"))?;
+    fs::write(package.join("shared.rs"), expected)?;
 
     let mut fmt = Command::new(tools.join("cargo-fmt"));
-    fmt.current_dir(&package)
+    fmt.current_dir(package)
         .env("OHM_INCREMENTAL_FMT", "1")
         .env("OHM_INCREMENTAL_FMT_TRACE", "1")
         .env("OHM_INCREMENTAL_FMT_CACHE_DIR", package.join("cache"))
         .env("DYLD_LIBRARY_PATH", &compiler_libraries)
         .env("LD_LIBRARY_PATH", &compiler_libraries)
         .env_remove("DYLD_FALLBACK_LIBRARY_PATH");
-    for attribute in ["", "#[cfg(any())]\n#[rustfmt_skip]\nfn old() {}\n"] {
+    Ok(fmt)
+}
+
+#[cfg(unix)]
+#[test]
+fn formatting_with_a_skipped_example_preserves_edition_order() -> std::io::Result<()> {
+    let directory = tempfile::tempdir()?;
+    let package = directory.path().canonicalize()?;
+    let mut fmt = shared_module_formatter(&package)?;
+    let shared = package.join("shared.rs");
+    let expected = fs::read_to_string(&shared)?;
+    fs::create_dir(package.join("examples"))?;
+    let example = package.join("examples/side.rs");
+    fs::write(&example, "fn main() {}\n")?;
+    let initial = fmt.output()?;
+    assert!(initial.status.success(), "{initial:?}");
+
+    // Skipping a root prevents rustfmt from publishing a complete module manifest.
+    fs::write(
+        &example,
+        "#![cfg_attr(rustfmt, rustfmt::skip)]\nfn main() {}\n",
+    )?;
+    fs::write(package.join("lib.rs"), "pub mod shared;\n")?;
+    let output = fmt.output()?;
+    assert!(output.status.success(), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("2 of 3 targets"), "{stderr}");
+    assert_eq!(fs::read_to_string(&shared)?, expected);
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn formatting_a_new_hard_link_preserves_edition_order() -> std::io::Result<()> {
+    let directory = tempfile::tempdir()?;
+    let package = directory.path().canonicalize()?;
+    let mut fmt = shared_module_formatter(&package)?;
+    let library = package.join("lib.rs");
+    let shared = package.join("shared.rs");
+    let expected = fs::read_to_string(&shared)?;
+    fs::hard_link(&shared, package.join("alias.rs"))?;
+
+    // This newly discovered configuration prevents taking a snapshot after the write.
+    fs::create_dir(package.join("nested"))?;
+    fs::hard_link(&shared, package.join("nested/mod.rs"))?;
+    fs::write(package.join("nested/rustfmt.toml"), "make_backup = true\n")?;
+    for (module, attribute) in [
+        ("alias", ""),
+        ("alias", "#[cfg(any())]\n#[rustfmt_skip]\nfn old() {}\n"),
+        ("nested", ""),
+    ] {
         fs::write(&library, "pub struct A;\n")?;
         let initial = fmt.output()?;
         assert!(initial.status.success(), "{initial:?}");
 
-        fs::write(&library, format!("pub mod alias;\n{attribute}"))?;
+        fs::write(&library, format!("pub mod {module};\n{attribute}"))?;
         let output = fmt.output()?;
         assert!(output.status.success(), "{output:?}");
         let stderr = String::from_utf8_lossy(&output.stderr);
