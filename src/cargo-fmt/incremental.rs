@@ -252,6 +252,10 @@ pub(super) fn format(
         .is_some_and(|leaves| leaves.len() > 1);
     let check_only = arguments.iter().any(|argument| argument == "--check");
     let partial_write = !check_only && changed_targets.len() < targets.len();
+    let reformat_all = || {
+        trace("reformatting all targets after a write changed a skipped source");
+        run_rustfmt(targets, arguments, verbosity)
+    };
     let mut output = run_rustfmt_with_output(
         &changed_targets,
         arguments,
@@ -270,8 +274,7 @@ pub(super) fn format(
         // Rustfmt can write through an alias before reporting a warning or error.
         // Only print the diagnostics of the run whose result we return.
         if partial_write && plan.current.skipped_source_changed(&changed_roots, None) {
-            trace("reformatting all targets after a write changed a skipped source");
-            return run_rustfmt(targets, arguments, verbosity);
+            return reformat_all();
         }
         if !output.deferred_diagnostics.is_empty() {
             io::stderr()
@@ -339,6 +342,11 @@ pub(super) fn format(
         match read_module_manifests(&output.module_manifests, &changed_targets) {
             Ok(discovered) => discovered,
             Err(error) => {
+                // A skipped root can prevent discovery even if another root wrote
+                // a module shared with a target we left out of this invocation.
+                if partial_write && plan.current.skipped_source_changed(&changed_roots, None) {
+                    return reformat_all();
+                }
                 if changed_leaves.is_some() {
                     trace(&format!(
                         "reformatting the target without an authoritative leaf proof: {error}"
@@ -514,26 +522,22 @@ pub(super) fn format(
                 trace(&format!("could not update the formatting cache: {error}"));
             }
         }
-        Ok(updated) => {
-            // A write through a hard link can change a skipped target even when
-            // the canonical paths differ. Restore the full edition order in that case.
+        snapshot => {
+            // A hard link can change a skipped source even when the paths differ.
+            // Check its metadata directly if a new configuration prevented capture.
             if !check_only
                 && !unchanged
                 && changed_targets.len() < targets.len()
                 && plan
                     .current
-                    .skipped_source_changed(&changed_roots, Some(&updated))
+                    .skipped_source_changed(&changed_roots, snapshot.as_ref().ok())
             {
-                trace("reformatting all targets after a write changed a skipped source");
-                return run_rustfmt(targets, arguments, verbosity);
+                return reformat_all();
             }
-            trace("not caching files changed concurrently with formatting");
-            if rewritten_leaf {
-                return run_rustfmt(&changed_targets, arguments, verbosity);
+            match snapshot {
+                Ok(_) => trace("not caching files changed concurrently with formatting"),
+                Err(error) => trace(&format!("could not verify formatted files: {error}")),
             }
-        }
-        Err(error) => {
-            trace(&format!("could not verify formatted files: {error}"));
             if rewritten_leaf {
                 return run_rustfmt(&changed_targets, arguments, verbosity);
             }
