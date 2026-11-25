@@ -1,5 +1,5 @@
 use std::collections::btree_map::Entry;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::env;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
@@ -1113,7 +1113,7 @@ impl Snapshot {
         let mut packages = BTreeMap::new();
         let mut file_fingerprints = BTreeMap::new();
         let mut observed_probes = BTreeMap::new();
-        let mut configuration_directories = BTreeSet::new();
+        let mut configuration_directories = HashSet::new();
 
         for target in targets {
             let package_path = path_string(&target.package_root)?;
@@ -1130,7 +1130,7 @@ impl Snapshot {
                 .map(String::as_str)
                 .chain(root_only);
 
-            configuration_directories.insert(target.package_root.clone());
+            configuration_directories.insert(target.package_root.as_path());
             let mut sources = BTreeMap::new();
             for path in paths {
                 let fingerprint = match file_fingerprints.entry(path.to_owned()) {
@@ -1148,7 +1148,7 @@ impl Snapshot {
                     }
                 };
                 if let Some(parent) = Path::new(path).parent() {
-                    configuration_directories.insert(parent.to_owned());
+                    configuration_directories.insert(parent);
                 }
                 sources.insert(path.to_owned(), fingerprint);
             }
@@ -1194,12 +1194,15 @@ impl Snapshot {
         }
 
         let current_directory = env::current_dir()?.canonicalize()?;
-        configuration_directories.insert(current_directory);
+        configuration_directories.insert(current_directory.as_path());
+        // Keep filesystem probes and error reporting in deterministic path order.
+        let mut configuration_directories: Vec<_> = configuration_directories.into_iter().collect();
+        configuration_directories.sort_unstable();
         let mut configuration = BTreeMap::new();
-        let mut visited_directories = BTreeSet::new();
+        let mut visited_directories = HashSet::new();
         for directory in configuration_directories {
             collect_ancestor_configuration(
-                &directory,
+                directory,
                 &mut visited_directories,
                 &mut configuration,
             )?;
@@ -1537,16 +1540,15 @@ fn observe_module_probe(path: &str) -> io::Result<ProbeObservation> {
 }
 
 /// Discovers workspace, toolchain, Cargo, and formatter configuration in every ancestor.
-fn collect_ancestor_configuration(
-    directory: &Path,
-    visited: &mut BTreeSet<PathBuf>,
+fn collect_ancestor_configuration<'a>(
+    directory: &'a Path,
+    visited: &mut HashSet<&'a Path>,
     configuration: &mut BTreeMap<String, String>,
 ) -> io::Result<()> {
     for ancestor in directory.ancestors() {
-        if visited.contains(ancestor) {
+        if !visited.insert(ancestor) {
             break;
         }
-        visited.insert(ancestor.to_owned());
         for name in [
             "rustfmt.toml",
             ".rustfmt.toml",
@@ -3187,14 +3189,21 @@ mod tests {
         fs::write(&cargo, "[build]\njobs = 4\n")?;
 
         let mut before = BTreeMap::new();
-        collect_ancestor_configuration(&nested, &mut BTreeSet::new(), &mut before)?;
+        collect_ancestor_configuration(&nested, &mut HashSet::new(), &mut before)?;
         assert!(before.contains_key(&path_string(&workspace)?));
         assert!(before.contains_key(&path_string(&cargo)?));
 
         let local = nested.join(".rustfmt.toml");
         fs::write(&local, "max_width = 80\n")?;
         let mut after = BTreeMap::new();
-        collect_ancestor_configuration(&nested, &mut BTreeSet::new(), &mut after)?;
+        let sibling = root.join("package/src/sibling");
+        fs::create_dir(&sibling)?;
+        let sibling_config = sibling.join("rustfmt.toml");
+        fs::write(&sibling_config, "max_width = 90\n")?;
+        let mut visited = HashSet::new();
+        collect_ancestor_configuration(&nested, &mut visited, &mut after)?;
+        collect_ancestor_configuration(&sibling, &mut visited, &mut after)?;
+        assert!(after.contains_key(&path_string(&sibling_config)?));
 
         assert!(after.contains_key(&path_string(&workspace)?));
         assert!(after.contains_key(&path_string(&cargo)?));
