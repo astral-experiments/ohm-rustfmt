@@ -1,5 +1,5 @@
-use std::collections::btree_map::Entry;
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::hash_map::Entry;
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::env;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
@@ -1111,8 +1111,8 @@ impl Snapshot {
         graph: impl Fn(&str, &str) -> TargetGraph<'a, Paths>,
     ) -> io::Result<Self> {
         let mut packages = BTreeMap::new();
-        let mut file_fingerprints = BTreeMap::new();
-        let mut observed_probes = BTreeMap::new();
+        let mut file_fingerprints = HashMap::new();
+        let mut observed_probes = HashMap::new();
         let mut configuration_directories = HashSet::new();
 
         for target in targets {
@@ -1133,17 +1133,17 @@ impl Snapshot {
             configuration_directories.insert(target.package_root.as_path());
             let mut sources = BTreeMap::new();
             for path in paths {
-                let fingerprint = match file_fingerprints.entry(path.to_owned()) {
+                let fingerprint = match file_fingerprints.entry(path) {
                     Entry::Occupied(entry) => *entry.get(),
                     Entry::Vacant(entry) => {
                         let (_, metadata) = canonical_module_file(path)?;
-                        observed_probes.entry(path.to_owned()).or_insert_with(|| {
-                            ProbeObservation {
+                        observed_probes
+                            .entry(path)
+                            .or_insert_with(|| ProbeObservation {
                                 canonical: Some(path.to_owned()),
                                 exists: true,
                                 is_directory: false,
-                            }
-                        });
+                            });
                         *entry.insert(SourceFingerprint::from_metadata(&metadata)?)
                     }
                 };
@@ -1170,7 +1170,7 @@ impl Snapshot {
             let mut target_probes = BTreeMap::new();
             if let Some(expected) = graph.probes {
                 for path in expected.keys() {
-                    let observation = match observed_probes.entry(path.to_owned()) {
+                    let observation = match observed_probes.entry(path.as_str()) {
                         Entry::Occupied(entry) => entry.into_mut(),
                         Entry::Vacant(entry) => entry.insert(observe_module_probe(path)?),
                     };
@@ -4052,20 +4052,29 @@ mod tests {
             expected.insert(alias.clone(), observe_module_probe(&alias)?);
         }
 
-        let targets = BTreeSet::from([target(&root, &package)]);
+        let targets = BTreeSet::from([target(&root, &package), target(&module, &package)]);
         let snapshot = Snapshot::capture(
             &targets,
             &[],
             None,
-            &ModuleGraph::from([(
-                root_path.clone(),
-                BTreeMap::from([
-                    (root_path.clone(), fingerprint("root")),
-                    (module_path.clone(), fingerprint("module")),
-                ]),
-            )]),
+            &ModuleGraph::from([
+                (
+                    root_path.clone(),
+                    BTreeMap::from([
+                        (root_path.clone(), fingerprint("root")),
+                        (module_path.clone(), fingerprint("module")),
+                    ]),
+                ),
+                (
+                    module_path.clone(),
+                    BTreeMap::from([(module_path.clone(), fingerprint("module"))]),
+                ),
+            ]),
             &LeafGraph::new(),
-            &ProbeGraph::from([(root_path.clone(), expected.clone())]),
+            &ProbeGraph::from([
+                (root_path.clone(), expected.clone()),
+                (module_path.clone(), expected.clone()),
+            ]),
             Some("canonical-source-probes"),
         )?;
 
@@ -4107,6 +4116,14 @@ mod tests {
         assert!(
             refreshed.packages[&package_path].probes[&root_path][&path_string(&missing)?].exists
         );
+        for captured in [&snapshot, &refreshed] {
+            let package = &captured.packages[&package_path];
+            assert_eq!(package.probes[&root_path], package.probes[&module_path]);
+            assert_eq!(
+                package.targets[&root_path][&module_path],
+                package.targets[&module_path][&module_path]
+            );
+        }
         Ok(())
     }
 
