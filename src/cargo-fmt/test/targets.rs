@@ -164,3 +164,34 @@ mod all_targets {
         }
     }
 }
+
+#[test]
+fn all_targets_includes_renamed_member_and_excluded_path_dependencies() {
+    let project = tempfile::tempdir().unwrap();
+    let root = project.path();
+    for name in ["app", "member", "outside"] {
+        let directory = root.join(name);
+        fs::create_dir_all(directory.join("src")).unwrap();
+        fs::write(directory.join("src/lib.rs"), "").unwrap();
+        let mut manifest = format!("[package]\nname = '{name}'\nversion = '0.1.0'\n");
+        if name == "app" {
+            manifest.push_str(
+                "[dependencies]\n\
+                 a = { package = 'member', path = '../member' }\n\
+                 b = { package = 'outside', path = '../outside' }\n",
+            );
+        }
+        fs::write(directory.join("Cargo.toml"), manifest).unwrap();
+    }
+    let manifest = root.join("Cargo.toml");
+    fs::write(
+        &manifest,
+        "[workspace]\nmembers = ['app', 'member']\nexclude = ['outside']\n",
+    )
+    .unwrap();
+    let targets = get_targets(&CargoFmtStrategy::All, Some(&manifest)).unwrap();
+    let paths: BTreeSet<_> = targets.into_iter().map(|target| target.path).collect();
+    let expected = ["app", "member", "outside"]
+        .map(|name| root.join(name).join("src/lib.rs").canonicalize().unwrap());
+    assert_eq!(paths, BTreeSet::from(expected));
+}
