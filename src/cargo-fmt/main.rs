@@ -4,7 +4,7 @@
 #![allow(clippy::match_like_matches_macro)]
 
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::env;
 use std::fs;
 use std::hash::{Hash, Hasher};
@@ -468,6 +468,11 @@ fn get_targets_recursive(
     visited: &mut BTreeSet<String>,
 ) -> Result<(), io::Error> {
     let metadata = get_cargo_metadata(manifest_path)?;
+    let workspace_manifests: HashSet<&Path> = metadata
+        .packages
+        .iter()
+        .map(|package| package.manifest_path.as_std_path())
+        .collect();
     for package in &metadata.packages {
         add_targets(
             &package.targets,
@@ -487,12 +492,7 @@ fn get_targets_recursive(
             }
 
             let manifest_path = PathBuf::from(dependency.path.as_ref().unwrap()).join("Cargo.toml");
-            if manifest_path.exists()
-                && !metadata
-                    .packages
-                    .iter()
-                    .any(|p| p.manifest_path.eq(&manifest_path))
-            {
+            if !workspace_manifests.contains(manifest_path.as_path()) && manifest_path.exists() {
                 visited.insert(dependency.name.to_owned());
                 get_targets_recursive(Some(&manifest_path), targets, visited)?;
             }
