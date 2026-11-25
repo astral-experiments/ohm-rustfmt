@@ -772,12 +772,30 @@ impl NodeIdExt for NodeId {
 }
 
 pub(crate) fn unicode_str_width(s: &str) -> usize {
+    // ASCII is one column per byte except for LF and CRLF.
+    if s.is_ascii() && !s.as_bytes().contains(&b'\n') {
+        return s.len();
+    }
     s.width()
 }
 
 #[cfg(test)]
 mod test {
     use super::*;
+
+    #[test]
+    fn width_matches_unicode_width() {
+        for first in 0..=127 {
+            for second in 0..=127 {
+                let bytes = [first, second];
+                let text = std::str::from_utf8(&bytes).unwrap();
+                assert_eq!(unicode_str_width(text), text.width(), "{text:?}");
+            }
+        }
+        for text in ["", "one\r\ntwo", "全角", "e\u{301}", "1\u{fe0f}\u{20e3}"] {
+            assert_eq!(unicode_str_width(text), text.width());
+        }
+    }
 
     #[test]
     fn test_remove_trailing_white_spaces() {
