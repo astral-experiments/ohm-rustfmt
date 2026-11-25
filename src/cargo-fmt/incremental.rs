@@ -403,7 +403,7 @@ pub(super) fn format(
     ) {
         Ok(updated)
             if plan.can_record(&updated, &changed_roots, check_only || unchanged)
-                && updated.probe_graph() == probes
+                && updated.matches_probes(&probes)
                 && (!rewritten_leaf
                     || plan.can_record_leaf_rewrite(
                         &updated,
@@ -1261,6 +1261,16 @@ impl Snapshot {
             .flat_map(|package| &package.targets)
             .map(|(target, sources)| (target.clone(), sources.clone()))
             .collect()
+    }
+
+    /// Compares the complete probe graph without copying each target's observations.
+    fn matches_probes(&self, probes: &ProbeGraph) -> bool {
+        let observed: BTreeMap<_, _> = self
+            .packages
+            .values()
+            .flat_map(|package| &package.probes)
+            .collect();
+        observed.into_iter().eq(probes)
     }
 
     fn probe_graph(&self) -> ProbeGraph {
@@ -2998,7 +3008,12 @@ mod tests {
             );
         }
 
-        assert_ne!(snapshot.probe_graph(), expected);
+        assert!(!snapshot.matches_probes(&expected));
+        assert!(!snapshot.matches_probes(&ProbeGraph::new()));
+        let mut observed = snapshot.probe_graph();
+        assert!(snapshot.matches_probes(&observed));
+        observed.insert(String::from("/workspace/other.rs"), BTreeMap::new());
+        assert!(!snapshot.matches_probes(&observed));
     }
 
     #[test]
