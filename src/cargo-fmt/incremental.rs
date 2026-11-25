@@ -250,12 +250,16 @@ pub(super) fn format(
     let batch = changed_leaves
         .as_ref()
         .is_some_and(|leaves| leaves.len() > 1);
+    let check_only = arguments.iter().any(|argument| argument == "--check");
+    let partial_write = !check_only && changed_targets.len() < targets.len();
     let mut output = run_rustfmt_with_output(
         &changed_targets,
         arguments,
         verbosity,
         if batch {
             RustfmtOutputMode::CaptureQuietly
+        } else if partial_write {
+            RustfmtOutputMode::DeferDiagnostics
         } else {
             RustfmtOutputMode::Inherit
         },
@@ -263,6 +267,17 @@ pub(super) fn format(
         requested_modules.as_deref(),
     )?;
     if output.status != SUCCESS || output.emitted_diagnostics {
+        // Rustfmt can write through an alias before reporting a warning or error.
+        // Only print the diagnostics of the run whose result we return.
+        if partial_write && plan.current.skipped_source_changed(&changed_roots, None) {
+            trace("reformatting all targets after a write changed a skipped source");
+            return run_rustfmt(targets, arguments, verbosity);
+        }
+        if !output.deferred_diagnostics.is_empty() {
+            io::stderr()
+                .lock()
+                .write_all(&output.deferred_diagnostics)?;
+        }
         if batch {
             trace(
                 "reformatting the complete target after a leaf batch failed or emitted diagnostics",
@@ -382,7 +397,6 @@ pub(super) fn format(
     modules.extend(discovered.modules);
     leaves.extend(discovered.leaves);
     probes.extend(discovered.probes);
-    let check_only = arguments.iter().any(|argument| argument == "--check");
     match Snapshot::capture(
         targets,
         arguments,
@@ -505,7 +519,19 @@ pub(super) fn format(
                 trace(&format!("could not update the formatting cache: {error}"));
             }
         }
-        Ok(_) => {
+        Ok(updated) => {
+            // A write through a hard link can change a skipped target even when
+            // the canonical paths differ. Restore the full edition order in that case.
+            if !check_only
+                && !unchanged
+                && changed_targets.len() < targets.len()
+                && plan
+                    .current
+                    .skipped_source_changed(&changed_roots, Some(&updated))
+            {
+                trace("reformatting all targets after a write changed a skipped source");
+                return run_rustfmt(targets, arguments, verbosity);
+            }
             trace("not caching files changed concurrently with formatting");
             if rewritten_leaf {
                 return run_rustfmt(&changed_targets, arguments, verbosity);
@@ -1198,6 +1224,29 @@ impl Snapshot {
             .values()
             .flat_map(|package| &package.targets)
             .all(|(target, sources)| modules.get(target) == Some(sources))
+    }
+
+    /// Checks skipped sources after a partial write, using the snapshot when available.
+    fn skipped_source_changed(&self, selected: &BTreeSet<&str>, updated: Option<&Self>) -> bool {
+        self.packages.iter().any(|(root, package)| {
+            package.targets.iter().any(|(target, sources)| {
+                if selected.contains(target.as_str()) {
+                    return false;
+                }
+                if let Some(updated) = updated {
+                    return updated
+                        .packages
+                        .get(root)
+                        .and_then(|p| p.targets.get(target))
+                        != Some(sources);
+                }
+                sources.iter().any(|(path, expected)| {
+                    !fs::metadata(path)
+                        .and_then(|metadata| SourceFingerprint::from_metadata(&metadata))
+                        .is_ok_and(|actual| actual == *expected)
+                })
+            })
+        })
     }
 
     fn module_graph(&self) -> ModuleGraph {

@@ -562,6 +562,7 @@ fn run_rustfmt(
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum RustfmtOutputMode {
     Inherit,
+    DeferDiagnostics,
     CaptureQuietly,
 }
 
@@ -569,6 +570,7 @@ enum RustfmtOutputMode {
 struct RustfmtOutput {
     status: i32,
     emitted_diagnostics: bool,
+    deferred_diagnostics: Vec<u8>,
     module_manifests: Vec<PathBuf>,
 }
 
@@ -595,6 +597,7 @@ fn run_rustfmt_with_output(
 
     let mut status = None;
     let mut emitted_diagnostics = false;
+    let mut deferred_diagnostics = Vec::new();
     let mut module_manifests = Vec::new();
     for (edition, files) in by_edition {
         let stdout =
@@ -668,6 +671,9 @@ fn run_rustfmt_with_output(
             Some(mut pipe) if output_mode == RustfmtOutputMode::Inherit => {
                 io::copy(&mut pipe, &mut io::stderr().lock())
             }
+            Some(mut pipe) if output_mode == RustfmtOutputMode::DeferDiagnostics => {
+                io::copy(&mut pipe, &mut deferred_diagnostics)
+            }
             Some(mut pipe) => io::copy(&mut pipe, &mut io::sink()),
             None => Ok(0),
         };
@@ -687,6 +693,7 @@ fn run_rustfmt_with_output(
     Ok(RustfmtOutput {
         status: status.unwrap_or(SUCCESS),
         emitted_diagnostics,
+        deferred_diagnostics,
         module_manifests,
     })
 }

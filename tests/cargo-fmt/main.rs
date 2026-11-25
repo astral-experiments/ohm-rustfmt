@@ -335,6 +335,52 @@ fn trusted_formatter_tools(
 
 #[cfg(unix)]
 #[test]
+fn formatting_a_new_hard_link_preserves_edition_order() -> std::io::Result<()> {
+    let directory = tempfile::tempdir()?;
+    let package = directory.path().canonicalize()?;
+    let (tools, compiler_libraries) = trusted_formatter_tools(&package)?;
+    fs::write(
+        package.join("Cargo.toml"),
+        "[package]\nname = 'mixed'\nversion = '0.1.0'\nedition = '2021'\n\
+         [lib]\npath = 'lib.rs'\n\
+         [[bin]]\nname = 'mixed'\npath = 'main.rs'\nedition = '2024'\n",
+    )?;
+    let library = package.join("lib.rs");
+    let shared = package.join("shared.rs");
+    fs::write(package.join("main.rs"), "mod shared;\nfn main() {}\n")?;
+    // Rust 2021 expands the if-expression. Rust 2024 formats it last and keeps it on one line.
+    let expected = "pub fn pick(x: bool) -> u8 {\n    if x { 1 } else { 2 }\n}\n";
+    fs::write(&shared, expected)?;
+    fs::hard_link(&shared, package.join("alias.rs"))?;
+
+    let mut fmt = Command::new(tools.join("cargo-fmt"));
+    fmt.current_dir(&package)
+        .env("OHM_INCREMENTAL_FMT", "1")
+        .env("OHM_INCREMENTAL_FMT_TRACE", "1")
+        .env("OHM_INCREMENTAL_FMT_CACHE_DIR", package.join("cache"))
+        .env("DYLD_LIBRARY_PATH", &compiler_libraries)
+        .env("LD_LIBRARY_PATH", &compiler_libraries)
+        .env_remove("DYLD_FALLBACK_LIBRARY_PATH");
+    for attribute in ["", "#[cfg(any())]\n#[rustfmt_skip]\nfn old() {}\n"] {
+        fs::write(&library, "pub struct A;\n")?;
+        let initial = fmt.output()?;
+        assert!(initial.status.success(), "{initial:?}");
+
+        fs::write(&library, format!("pub mod alias;\n{attribute}"))?;
+        let output = fmt.output()?;
+        assert!(output.status.success(), "{output:?}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("1 of 2 targets"), "{stderr}");
+        if !attribute.is_empty() {
+            assert_eq!(stderr.matches("is deprecated").count(), 1, "{stderr}");
+        }
+        assert_eq!(fs::read_to_string(&shared)?, expected);
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
 fn failed_mixed_edition_check_cleans_up_module_manifests() -> std::io::Result<()> {
     let directory = tempfile::tempdir()?;
     let package = directory.path().canonicalize()?;
