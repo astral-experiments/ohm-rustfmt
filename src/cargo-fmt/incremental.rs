@@ -353,12 +353,8 @@ pub(super) fn format(
         }
     };
 
-    if !rewritten_leaf
-        && discovers_new_shared_owner(
-            &plan.current.module_graph(),
-            &discovered.modules,
-            &changed_roots,
-        )
+    let mut modules = plan.current.module_graph();
+    if !rewritten_leaf && discovers_new_shared_owner(&modules, &discovered.modules, &changed_roots)
     {
         trace("reformatting all targets after discovering a new shared module owner");
         changed_targets = targets.clone();
@@ -391,7 +387,6 @@ pub(super) fn format(
     }
 
     let unchanged = discovered.unchanged;
-    let mut modules = plan.current.module_graph();
     let mut leaves = plan.current.leaf_graph();
     let mut probes = plan.current.probe_graph();
     modules.extend(discovered.modules);
@@ -711,13 +706,21 @@ fn discovers_new_shared_owner(
     discovered: &ModuleGraph,
     selected: &BTreeSet<&str>,
 ) -> bool {
+    // A complete formatting pass has no other owners to discover. For a
+    // partial pass, filter roots once instead of for every new file.
+    let unselected: Vec<_> = previous
+        .iter()
+        .filter(|(root, _)| !selected.contains(root.as_str()))
+        .map(|(_, files)| files)
+        .collect();
+    if unselected.is_empty() {
+        return false;
+    }
     discovered.iter().any(|(root, files)| {
         let old_files = previous.get(root);
         files.keys().any(|file| {
             !old_files.is_some_and(|previous| previous.contains_key(file))
-                && previous.iter().any(|(other_root, other_files)| {
-                    !selected.contains(other_root.as_str()) && other_files.contains_key(file)
-                })
+                && unselected.iter().any(|other| other.contains_key(file))
         })
     })
 }
@@ -3111,6 +3114,12 @@ mod tests {
             &previous,
             &discovered,
             &BTreeSet::from(["/workspace/first/src/lib.rs"]),
+        ));
+        // Equal counts alone do not establish that every old root is selected.
+        assert!(discovers_new_shared_owner(
+            &previous,
+            &discovered,
+            &BTreeSet::from(["/workspace/first/src/lib.rs", "/workspace/third/src/lib.rs",]),
         ));
         assert!(!discovers_new_shared_owner(
             &previous,
