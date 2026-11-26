@@ -38,17 +38,50 @@ pub(crate) struct LeafInputs {
     pub(crate) leaf: SourceFingerprint,
 }
 
-/// Mirrors Ruff's source identity without reading the contents of cached files.
-///
-/// Like Ruff, this deliberately trusts filesystem modification timestamps. An
-/// edit that also restores its previous timestamp and permissions is therefore
-/// outside the cache's trust boundary.
+/// Source identity for incremental formatting. Like Ruff, this trusts filesystem
+/// metadata. On Unix, restoring the modification time normally changes the
+/// status change time. Filesystems that restore or coarsen both timestamps
+/// can still hide edits within a single file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(into = "StoredFingerprint", from = "StoredFingerprint")]
 pub(crate) struct SourceFingerprint {
     pub(crate) modified_seconds: i64,
     pub(crate) modified_nanoseconds: u32,
     pub(crate) permissions_mode: u32,
+    /// Device and inode on Unix. Swapping directories can preserve both timestamps.
+    pub(crate) file_id: (u64, u64),
+    /// None when identical to the modification time or unavailable.
+    pub(crate) changed: Option<(i64, i64)>,
+}
+
+// Avoid repeating field names and two usually identical timestamps for every
+// source in the versioned cache and module manifest.
+type StoredFingerprint = (i64, u32, u32, u64, u64, Option<(i64, i64)>);
+
+impl From<SourceFingerprint> for StoredFingerprint {
+    fn from(source: SourceFingerprint) -> Self {
+        (
+            source.modified_seconds,
+            source.modified_nanoseconds,
+            source.permissions_mode,
+            source.file_id.0,
+            source.file_id.1,
+            source.changed,
+        )
+    }
+}
+
+impl From<StoredFingerprint> for SourceFingerprint {
+    fn from(stored: StoredFingerprint) -> Self {
+        let (modified_seconds, modified_nanoseconds, permissions_mode, dev, ino, changed) = stored;
+        Self {
+            modified_seconds,
+            modified_nanoseconds,
+            permissions_mode,
+            file_id: (dev, ino),
+            changed,
+        }
+    }
 }
 
 impl SourceFingerprint {
@@ -79,7 +112,26 @@ impl SourceFingerprint {
         #[cfg(not(unix))]
         let permissions_mode = u32::from(metadata.permissions().readonly());
 
+        #[cfg(unix)]
+        let changed = {
+            use std::os::unix::fs::MetadataExt;
+            let time = (metadata.ctime(), metadata.ctime_nsec());
+            (time != (modified_seconds, i64::from(modified_nanoseconds))).then_some(time)
+        };
+        #[cfg(not(unix))]
+        let changed = None;
+
+        #[cfg(unix)]
+        let file_id = {
+            use std::os::unix::fs::MetadataExt;
+            (metadata.dev(), metadata.ino())
+        };
+        #[cfg(not(unix))]
+        let file_id = (0, 0);
+
         Ok(Self {
+            file_id,
+            changed,
             modified_seconds,
             modified_nanoseconds,
             permissions_mode,
