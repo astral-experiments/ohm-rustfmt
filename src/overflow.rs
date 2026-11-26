@@ -355,6 +355,7 @@ struct Context<'a> {
     context: &'a RewriteContext<'a>,
     items: Vec<OverflowableItem<'a>>,
     ident: &'a str,
+    ident_width: usize,
     prefix: &'static str,
     suffix: &'static str,
     one_line_shape: Shape,
@@ -384,8 +385,9 @@ impl<'a> Context<'a> {
         let one_line_width = shape.width.saturating_sub(used_width + 2);
 
         // 1 = "(" or ")"
+        let ident_width = last_line_width(ident, context.config.tab_spaces());
         let one_line_shape = shape
-            .offset_left_opt(last_line_width(ident, context.config.tab_spaces()) + 1)
+            .offset_left_opt(ident_width + 1)
             .and_then(|shape| shape.sub_width_opt(1))
             .unwrap_or(Shape { width: 0, ..shape });
         let nested_shape = shape_from_indent_style(context, shape, used_width + 2, used_width + 1);
@@ -393,6 +395,7 @@ impl<'a> Context<'a> {
             context,
             items: into_overflowable_list(items).collect(),
             ident,
+            ident_width,
             one_line_shape,
             nested_shape,
             span,
@@ -525,26 +528,25 @@ impl<'a> Context<'a> {
             None
         };
 
-        let mut tactic = definitive_tactic(
-            &*list_items,
-            ListTactic::LimitedHorizontalVertical(self.item_max_width),
-            Separator::Comma,
-            self.one_line_width,
-        );
+        // Without a placeholder the last item hasn't been rewritten yet.
+        // Pick the layout below once it is available.
+        let mut tactic = if placeholder.is_some() {
+            self.default_tactic(list_items)
+        } else {
+            DefinitiveListTactic::Horizontal
+        };
 
         // Replace the stub with the full overflowing last argument if the rewrite
         // succeeded and its first line fits with the other arguments.
         match (overflow_last, tactic, placeholder) {
-            (true, DefinitiveListTactic::Horizontal, Some(ref overflowed))
-                if self.items.len() == 1 =>
-            {
+            (true, DefinitiveListTactic::Horizontal, Some(overflowed)) if self.items.len() == 1 => {
                 // When we are rewriting a nested function call, we restrict the
                 // budget for the inner function to avoid them being deeply nested.
                 // However, when the inner function has a prefix or a suffix
                 // (e.g., `foo() as u32`), this budget reduction may produce poorly
                 // formatted code, where a prefix or a suffix being left on its own
                 // line. Here we explicitly check those cases.
-                if count_newlines(overflowed) == 1 {
+                if count_newlines(&overflowed) == 1 {
                     let rw = self
                         .items
                         .last()
@@ -553,10 +555,10 @@ impl<'a> Context<'a> {
                     if no_newline {
                         list_items[self.items.len() - 1].item = rw.unknown_error();
                     } else {
-                        list_items[self.items.len() - 1].item = Ok(overflowed.to_owned());
+                        list_items[self.items.len() - 1].item = Ok(overflowed);
                     }
                 } else {
-                    list_items[self.items.len() - 1].item = Ok(overflowed.to_owned());
+                    list_items[self.items.len() - 1].item = Ok(overflowed);
                 }
             }
             (true, DefinitiveListTactic::Horizontal, placeholder @ Some(..)) => {
@@ -621,6 +623,19 @@ impl<'a> Context<'a> {
     }
 
     fn rewrite_items(&self) -> Result<(bool, String), RewriteError> {
+        let trailing_separator = if let Some(tactic) = self.force_separator_tactic {
+            tactic
+        } else if !self.context.use_block_indent() {
+            SeparatorTactic::Never
+        } else {
+            self.context.config.trailing_comma()
+        };
+
+        // An empty list always fits horizontally. Keep wrapping it normally,
+        // as the delimiters themselves may not fit on the current line.
+        if self.items.is_empty() {
+            return Ok((true, String::new()));
+        }
         let span = self.items_span();
         debug!("items: {:?}", self.items);
 
@@ -644,13 +659,6 @@ impl<'a> Context<'a> {
         // indentation. If its first line fits on one line with the other arguments,
         // we format the function arguments horizontally.
         let tactic = self.try_overflow_last_item(&mut list_items);
-        let trailing_separator = if let Some(tactic) = self.force_separator_tactic {
-            tactic
-        } else if !self.context.use_block_indent() {
-            SeparatorTactic::Never
-        } else {
-            self.context.config.trailing_comma()
-        };
         let ends_with_newline = match tactic {
             DefinitiveListTactic::Vertical | DefinitiveListTactic::Mixed => {
                 self.context.use_block_indent()
@@ -663,16 +671,23 @@ impl<'a> Context<'a> {
             .trailing_separator(trailing_separator)
             .ends_with_newline(ends_with_newline);
 
+        // A single horizontal item with no comments or separator is
+        // already the list text. Keep its buffer for wrapping.
+        if tactic == DefinitiveListTactic::Horizontal
+            && list_items.len() == 1
+            && !list_items[0].has_comment()
+            && !fmt.needs_trailing_separator()
+        {
+            return list_items.pop().unwrap().item.map(|item| (true, item));
+        }
+
         write_list(&list_items, &fmt)
             .map(|items_str| (tactic == DefinitiveListTactic::Horizontal, items_str))
     }
 
     fn wrap_items(&self, items_str: &str, shape: Shape, is_extendable: bool) -> String {
         let shape = Shape {
-            width: shape.width.saturating_sub(last_line_width(
-                self.ident,
-                self.context.config.tab_spaces(),
-            )),
+            width: shape.width.saturating_sub(self.ident_width),
             ..shape
         };
 

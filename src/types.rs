@@ -122,7 +122,8 @@ where
 
         let extra_offset = extra_offset(&buffer, shape);
         let new_shape = shape.shrink_left(extra_offset, mk_sp(span_lo, span_hi))?;
-        let segment_string = rewrite_segment(
+        rewrite_segment(
+            &mut buffer,
             path_context,
             segment,
             &mut span_lo,
@@ -130,8 +131,6 @@ where
             context,
             new_shape,
         )?;
-
-        buffer.push_str(&segment_string);
     }
 
     Ok(buffer)
@@ -263,17 +262,18 @@ impl Rewrite for ast::AssocItemConstraintKind {
 // When the segment contains a positive number of parameters, we update span_lo
 // so that invariants described above will hold for the next segment.
 fn rewrite_segment(
+    result: &mut String,
     path_context: PathContext,
     segment: &ast::PathSegment,
     span_lo: &mut BytePos,
     span_hi: BytePos,
     context: &RewriteContext<'_>,
     shape: Shape,
-) -> RewriteResult {
-    let mut result = String::with_capacity(128);
-    result.push_str(rewrite_ident(context, segment.ident));
+) -> Result<(), RewriteError> {
+    let ident = rewrite_ident(context, segment.ident);
+    result.push_str(ident);
 
-    let ident_len = result.len();
+    let ident_len = ident.len();
     let span = mk_sp(*span_lo, span_hi);
     let shape = if context.use_block_indent() {
         shape.offset_left(ident_len, span)?
@@ -310,7 +310,7 @@ fn rewrite_segment(
         result.push_str(&generics_str)
     }
 
-    Ok(result)
+    Ok(())
 }
 
 fn format_function_type(

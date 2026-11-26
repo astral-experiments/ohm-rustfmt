@@ -23,10 +23,12 @@ impl Emitter for DiffEmitter {
         }: FormattedFile<'_>,
     ) -> Result<EmitterResult, io::Error> {
         const CONTEXT_SIZE: usize = 3;
+        // Successful checks don't need to split the text into lines or build a diff.
+        if original_text == formatted_text {
+            return Ok(EmitterResult { has_diff: false });
+        }
         let mismatch = make_diff(original_text, formatted_text, CONTEXT_SIZE);
-        let has_diff = !mismatch.is_empty();
-
-        if has_diff {
+        if !mismatch.is_empty() {
             if self.config.print_misformatted_file_names() {
                 writeln!(output, "{filename}")?;
             } else {
@@ -36,15 +38,14 @@ impl Emitter for DiffEmitter {
                     &self.config,
                 );
             }
-        } else if original_text != formatted_text {
+        } else {
             // This occurs when the only difference between the original and formatted values
             // is the newline style. This happens because The make_diff function compares the
             // original and formatted values line by line, independent of line endings.
             writeln!(output, "Incorrect newline style in {filename}")?;
-            return Ok(EmitterResult { has_diff: true });
         }
 
-        Ok(EmitterResult { has_diff })
+        Ok(EmitterResult { has_diff: true })
     }
 }
 
@@ -70,6 +71,26 @@ mod tests {
             .unwrap();
         assert_eq!(result.has_diff, false);
         assert_eq!(writer.len(), 0);
+    }
+
+    #[test]
+    fn equal_length_edits_still_report_a_diff() {
+        let mut config = Config::default();
+        config.set().print_misformatted_file_names(true);
+        let mut emitter = DiffEmitter::new(config);
+        let mut writer = Vec::new();
+        let result = emitter
+            .emit_formatted_file(
+                &mut writer,
+                FormattedFile {
+                    filename: &FileName::Real(PathBuf::from("src/lib.rs")),
+                    original_text: "fn  hello(){}\n",
+                    formatted_text: "fn hello() {}\n",
+                },
+            )
+            .unwrap();
+        assert!(result.has_diff);
+        assert_eq!(writer, b"src/lib.rs\n");
     }
 
     #[test]

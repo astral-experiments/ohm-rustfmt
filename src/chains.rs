@@ -164,12 +164,6 @@ enum CommentPosition {
     DifferentLine,
 }
 
-/// Information about an expression in a chain.
-struct SubExpr {
-    expr: ast::Expr,
-    is_postfix_receiver: bool,
-}
-
 /// An expression plus trailing `?`s to be formatted together.
 #[derive(Debug)]
 struct ChainItem {
@@ -303,7 +297,7 @@ impl Rewrite for ChainItem {
 
     fn rewrite_result(&self, context: &RewriteContext<'_>, shape: Shape) -> RewriteResult {
         let shape = shape.sub_width(self.tries, self.span)?;
-        let rewrite = match self.kind {
+        let mut rewrite = match self.kind {
             ChainItemKind::Parent {
                 ref expr,
                 parens: true,
@@ -332,21 +326,34 @@ impl Rewrite for ChainItem {
                 rewrite_comment(comment, false, shape, context.config)?
             }
         };
-        Ok(format!("{rewrite}{}", "?".repeat(self.tries)))
+        for _ in 0..self.tries {
+            rewrite.push('?');
+        }
+        Ok(rewrite)
     }
 }
 
 impl ChainItem {
-    fn new(context: &RewriteContext<'_>, expr: &SubExpr, tries: usize) -> ChainItem {
-        let (kind, span) = ChainItemKind::from_ast(context, &expr.expr, expr.is_postfix_receiver);
-        ChainItem { kind, tries, span }
-    }
-
     fn comment(span: Span, comment: String, pos: CommentPosition) -> ChainItem {
         ChainItem {
             kind: ChainItemKind::Comment(comment, pos),
             tries: 0,
             span,
+        }
+    }
+
+    // These suffixes cannot fail after subtracting the question marks from
+    // the width. In particular, an empty argument list needs no recursive
+    // formatting, even when it contains whitespace or comments.
+    fn is_leaf_suffix(&self) -> bool {
+        match &self.kind {
+            ChainItemKind::MethodCall(_, types, args) => types.is_empty() && args.is_empty(),
+            ChainItemKind::StructField(_)
+            | ChainItemKind::TupleField { .. }
+            | ChainItemKind::Await
+            | ChainItemKind::Use
+            | ChainItemKind::Yield => true,
+            ChainItemKind::Parent { .. } | ChainItemKind::Comment(..) => false,
         }
     }
 
@@ -385,20 +392,7 @@ struct Chain {
 
 impl Chain {
     fn from_ast(expr: &ast::Expr, context: &RewriteContext<'_>) -> Chain {
-        let subexpr_list = Self::make_subexpr_list(expr, context);
-
-        // Un-parse the expression tree into ChainItems
-        let mut rev_children = vec![];
-        let mut sub_tries = 0;
-        for subexpr in &subexpr_list {
-            match subexpr.expr.kind {
-                ast::ExprKind::Try(_) => sub_tries += 1,
-                _ => {
-                    rev_children.push(ChainItem::new(context, subexpr, sub_tries));
-                    sub_tries = 0;
-                }
-            }
-        }
+        let mut rev_children = Self::chain_items(expr, context);
 
         fn is_tries(s: &str) -> bool {
             s.chars().all(|c| c == '?')
@@ -504,52 +498,49 @@ impl Chain {
         Chain { parent, children }
     }
 
-    // Returns a Vec of the prefixes of the chain.
-    // E.g., for input `a.b.c` we return [`a.b.c`, `a.b`, 'a']
-    fn make_subexpr_list(expr: &ast::Expr, context: &RewriteContext<'_>) -> Vec<SubExpr> {
-        let mut subexpr_list = vec![SubExpr {
-            expr: expr.clone(),
-            is_postfix_receiver: false,
-        }];
-
-        while let Some(subexpr) = Self::pop_expr_chain(&subexpr_list.last().unwrap().expr, context)
-        {
-            subexpr_list.push(subexpr);
-        }
-
-        subexpr_list
-    }
-
-    // Returns the expression's subexpression, if it exists. When the subexpr
-    // is a try! macro, we'll convert it to shorthand when the option is set.
-    fn pop_expr_chain(expr: &ast::Expr, context: &RewriteContext<'_>) -> Option<SubExpr> {
-        match &expr.kind {
-            ast::ExprKind::MethodCall(call) => Some(SubExpr {
-                expr: Self::convert_try(&call.receiver, context),
-                is_postfix_receiver: true,
-            }),
-            ast::ExprKind::Field(subexpr, _)
-            | ast::ExprKind::Await(subexpr, _)
-            | ast::ExprKind::Use(subexpr, _)
-            | ast::ExprKind::Yield(ast::YieldKind::Postfix(subexpr)) => Some(SubExpr {
-                expr: Self::convert_try(subexpr, context),
-                is_postfix_receiver: true,
-            }),
-            ast::ExprKind::Try(subexpr) => Some(SubExpr {
-                expr: Self::convert_try(subexpr, context),
-                is_postfix_receiver: false,
-            }),
-            _ => None,
-        }
-    }
-
-    fn convert_try(expr: &ast::Expr, context: &RewriteContext<'_>) -> ast::Expr {
-        match &expr.kind {
-            ast::ExprKind::MacCall(mac) if context.config.use_try_shorthand() => {
-                convert_try_mac(mac, context).unwrap_or(expr.clone())
+    // Walk prefixes from the outermost expression to the root. Each chain item
+    // owns the data it needs, so we can borrow the remaining prefix instead of
+    // repeatedly cloning the entire subtree.
+    fn chain_items(expr: &ast::Expr, context: &RewriteContext<'_>) -> Vec<ChainItem> {
+        let mut items = Vec::new();
+        let mut current = expr;
+        let mut is_postfix_receiver = false;
+        let mut tries = 0;
+        let mut converted;
+        loop {
+            if matches!(current.kind, ast::ExprKind::Try(_)) {
+                tries += 1;
+            } else {
+                let (kind, span) = ChainItemKind::from_ast(context, current, is_postfix_receiver);
+                items.push(ChainItem { kind, tries, span });
+                tries = 0;
             }
-            _ => expr.clone(),
+
+            let (next, postfix) = match &current.kind {
+                ast::ExprKind::MethodCall(call) => (&call.receiver, true),
+                ast::ExprKind::Field(receiver, _)
+                | ast::ExprKind::Await(receiver, _)
+                | ast::ExprKind::Use(receiver, _)
+                | ast::ExprKind::Yield(ast::YieldKind::Postfix(receiver)) => (receiver, true),
+                ast::ExprKind::Try(inner) => (inner, false),
+                _ => break,
+            };
+            is_postfix_receiver = postfix;
+            // Keep a synthesized try! replacement alive while walking its prefix.
+            let replacement = match &next.kind {
+                ast::ExprKind::MacCall(mac) if context.config.use_try_shorthand() => {
+                    convert_try_mac(mac, context)
+                }
+                _ => None,
+            };
+            current = if let Some(replacement) = replacement {
+                converted = replacement;
+                &converted
+            } else {
+                next
+            };
         }
+        items
     }
 }
 
@@ -795,15 +786,27 @@ impl<'a> ChainFormatterShared<'a> {
                             shape.rhs_overhead(context.config) + last.tries,
                             last.span,
                         )?;
-                        match last.rewrite_result(context, last_shape) {
-                            Ok(ref new_rw) if !could_fit_single_line => {
-                                last_subexpr_str = Some(new_rw.clone());
-                            }
-                            Ok(ref new_rw) if new_rw.lines().count() >= line_count => {
-                                last_subexpr_str = Some(rw);
-                                self.fits_single_line = could_fit_single_line && all_in_one_line;
-                            }
-                            Ok(new_rw) => {
+                        // A vertical rewrite can't beat a fitting single line: the last
+                        // chain item is nonempty, and ties and failures both favor rw.
+                        // Keep visiting macros, attributes, blocks and comments, whose
+                        // rewrites can update skipped ranges or emit diagnostics.
+                        let already_shortest = could_fit_single_line
+                            && line_count == 1
+                            && (last.is_leaf_suffix()
+                                || context
+                                    .snippet_provider
+                                    .span_to_snippet(last.span)
+                                    .is_some_and(|s| !s.contains(['!', '#', '{', '/'])));
+                        let vertical = if already_shortest {
+                            None
+                        } else {
+                            last.rewrite_result(context, last_shape).ok()
+                        };
+                        match vertical {
+                            Some(new_rw)
+                                if !could_fit_single_line
+                                    || new_rw.lines().count() < line_count =>
+                            {
                                 last_subexpr_str = Some(new_rw);
                             }
                             _ => {
@@ -822,8 +825,14 @@ impl<'a> ChainFormatterShared<'a> {
             child_shape.sub_width(shape.rhs_overhead(context.config) + last.tries, last.span)?
         };
 
-        let last_subexpr_str =
-            last_subexpr_str.unwrap_or(last.rewrite_result(context, last_shape)?);
+        let last_subexpr_str = match last_subexpr_str {
+            Some(text) if last.is_leaf_suffix() => {
+                last_shape.sub_width(last.tries, last.span)?;
+                text
+            }
+            // Other suffixes still need the fallback's errors and side effects.
+            selected => selected.unwrap_or(last.rewrite_result(context, last_shape)?),
+        };
         self.rewrites.push(last_subexpr_str);
         Ok(())
     }

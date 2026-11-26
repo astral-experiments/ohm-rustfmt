@@ -485,12 +485,8 @@ impl<'a, T: FormatHandler + 'a> FormatContext<'a, T> {
         self.report
             .add_non_formatted_ranges(visitor.skipped_range.borrow().clone());
 
-        self.handler.handle_formatted_file(
-            &self.psess,
-            path,
-            visitor.buffer.to_owned(),
-            &mut self.report,
-        )?;
+        self.handler
+            .handle_formatted_file(&self.psess, path, &visitor.buffer, &mut self.report)?;
         Ok(direct_mode)
     }
 }
@@ -517,7 +513,7 @@ trait FormatHandler {
         &mut self,
         psess: &ParseSess,
         path: FileName,
-        result: String,
+        result: &str,
         report: &mut FormatReport,
     ) -> Result<(), ErrorKind>;
 }
@@ -547,7 +543,7 @@ impl<'b, T: Write + 'b> FormatHandler for Session<'b, T> {
         &mut self,
         psess: &ParseSess,
         path: FileName,
-        result: String,
+        result: &str,
         report: &mut FormatReport,
     ) -> Result<(), ErrorKind> {
         if let Some(ref mut out) = self.out {
@@ -559,7 +555,7 @@ impl<'b, T: Write + 'b> FormatHandler for Session<'b, T> {
             match source_file::write_file(
                 Some(psess),
                 &path,
-                &result,
+                result,
                 out,
                 &mut *self.emitter,
                 self.config.newline_style(),
@@ -577,9 +573,10 @@ impl<'b, T: Write + 'b> FormatHandler for Session<'b, T> {
                 self.module_graph = None;
             }
             self.rewritten_sources |= !unchanged;
+        } else {
+            // Sessions without a writer collect the formatted files in memory.
+            self.source_file.push((path, result.to_owned()));
         }
-
-        self.source_file.push((path, result));
         Ok(())
     }
 }
@@ -741,7 +738,17 @@ fn format_lines(
     report: &FormatReport,
 ) {
     let mut formatter = FormatLines::new(name, skipped_range, config);
-    formatter.iterate(text);
+    // Character classification is only needed for overflow and trailing-whitespace
+    // diagnostics. Split on LF (not lines()) so a CR also triggers the full check.
+    if !config.error_on_line_overflow()
+        && text
+            .split('\n')
+            .all(|line| !line.ends_with(char::is_whitespace))
+    {
+        formatter.newline_count = text.len() - text.trim_end_matches('\n').len();
+    } else {
+        formatter.iterate(text);
+    }
 
     if formatter.newline_count > 1 {
         debug!("track truncate: {} {}", text.len(), formatter.newline_count);
@@ -750,6 +757,24 @@ fn format_lines(
     }
 
     report.append(name.clone(), formatter.errors);
+}
+
+#[test]
+fn final_line_check_preserves_diagnostics_and_trimming() {
+    let mut config = Config::default();
+    config.set().error_on_line_overflow(false);
+    for (input, expected, has_error) in [
+        ("α\n\n\n", "α\n", false),
+        ("α\n\nβ", "α\n\nβ", false),
+        ("α\u{2003}\n\n", "α\u{2003}\n", true),
+        ("α \r\n", "α \r\n", true),
+    ] {
+        let mut text = input.to_owned();
+        let report = FormatReport::new();
+        format_lines(&mut text, &FileName::Stdin, &[], &config, &report);
+        assert_eq!(text, expected);
+        assert_eq!(report.internal.borrow().1.has_formatting_errors, has_error);
+    }
 }
 
 struct FormatLines<'a> {

@@ -814,12 +814,13 @@ impl<'b, 'a: 'b> FmtVisitor<'a> {
         self.skipped_range.borrow_mut().push((lo, hi));
     }
 
-    pub(crate) fn from_context(ctx: &'a RewriteContext<'_>) -> FmtVisitor<'a> {
-        let mut visitor = FmtVisitor::from_psess(
+    pub(crate) fn from_context(ctx: &'a RewriteContext<'_>, span: Span) -> FmtVisitor<'a> {
+        let mut visitor = FmtVisitor::with_input_len(
             ctx.psess,
             ctx.config,
             ctx.snippet_provider,
             ctx.report.clone(),
+            (span.hi() - span.lo()).0 as usize,
         );
         visitor.skip_context.update(ctx.skip_context.clone());
         visitor.set_parent_context(ctx);
@@ -831,6 +832,23 @@ impl<'b, 'a: 'b> FmtVisitor<'a> {
         config: &'a Config,
         snippet_provider: &'a SnippetProvider,
         report: FormatReport,
+    ) -> FmtVisitor<'a> {
+        Self::with_input_len(
+            psess,
+            config,
+            snippet_provider,
+            report,
+            snippet_provider.big_snippet.len(),
+        )
+    }
+
+    // Nested visitors format only one block or item of the shared source file.
+    fn with_input_len(
+        psess: &'a ParseSess,
+        config: &'a Config,
+        snippet_provider: &'a SnippetProvider,
+        report: FormatReport,
+        input_len: usize,
     ) -> FmtVisitor<'a> {
         let mut skip_context = SkipContext::default();
         let mut macro_names = Vec::new();
@@ -844,7 +862,7 @@ impl<'b, 'a: 'b> FmtVisitor<'a> {
         FmtVisitor {
             parent_context: None,
             psess,
-            buffer: String::with_capacity(snippet_provider.big_snippet.len() * 2),
+            buffer: String::with_capacity(input_len.min(snippet_provider.big_snippet.len()) * 2),
             last_pos: BytePos(0),
             block_indent: Indent::empty(),
             config,
@@ -1037,7 +1055,7 @@ impl<'b, 'a: 'b> FmtVisitor<'a> {
             !skipped,
             "Skipping module must be handled before reaching this line."
         );
-        self.walk_mod_items(&m.items);
+        self.walk_mod_items(m.items());
         self.format_missing_with_indent(end_pos);
     }
 
@@ -1124,4 +1142,24 @@ impl<'b, 'a: 'b> FmtVisitor<'a> {
             }
         }
     }
+}
+
+#[test]
+fn nested_buffer_capacity_tracks_the_fragment() {
+    let config = Config::default();
+    rustc_span::create_session_if_not_set_then(config.edition().into(), |_| {
+        let session = ParseSess::new(&config, None).unwrap();
+        let provider = SnippetProvider {
+            big_snippet: Arc::new(" ".repeat(8192)),
+            start_pos: 0,
+            end_pos: 8192,
+        };
+        let file = FmtVisitor::from_psess(&session, &config, &provider, FormatReport::new());
+        let context = file.get_context();
+        let mut nested = FmtVisitor::from_context(&context, mk_sp(BytePos(120), BytePos(124)));
+        assert!(file.buffer.capacity() >= 8192);
+        assert!(nested.buffer.capacity() < 8192);
+        nested.buffer.push_str("a much longer formatted block");
+        assert_eq!(nested.buffer, "a much longer formatted block");
+    });
 }

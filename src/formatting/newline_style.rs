@@ -13,6 +13,7 @@ pub(crate) fn apply_newline_style(
 ) {
     *formatted_text = match effective_newline_style(newline_style, raw_input_text) {
         EffectiveNewlineStyle::Windows => convert_to_windows_newlines(formatted_text),
+        EffectiveNewlineStyle::Unix if !formatted_text.contains(CARRIAGE_RETURN) => return,
         EffectiveNewlineStyle::Unix => convert_to_unix_newlines(formatted_text),
     }
 }
@@ -41,16 +42,9 @@ const WINDOWS_NEWLINE: &str = "\r\n";
 const UNIX_NEWLINE: &str = "\n";
 
 fn auto_detect_newline_style(raw_input_text: &str) -> EffectiveNewlineStyle {
-    let first_line_feed_pos = raw_input_text.chars().position(|ch| ch == LINE_FEED);
-    match first_line_feed_pos {
-        Some(first_line_feed_pos) => {
-            let char_before_line_feed_pos = first_line_feed_pos.saturating_sub(1);
-            let char_before_line_feed = raw_input_text.chars().nth(char_before_line_feed_pos);
-            match char_before_line_feed {
-                Some(CARRIAGE_RETURN) => EffectiveNewlineStyle::Windows,
-                _ => EffectiveNewlineStyle::Unix,
-            }
-        }
+    match raw_input_text.split_once(LINE_FEED) {
+        Some((line, _)) if line.ends_with(CARRIAGE_RETURN) => EffectiveNewlineStyle::Windows,
+        Some(_) => EffectiveNewlineStyle::Unix,
         None => native_newline_style(),
     }
 }
@@ -84,6 +78,18 @@ fn convert_to_unix_newlines(formatted_text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn auto_detection_uses_the_first_newline_after_multibyte_text() {
+        assert_eq!(
+            auto_detect_newline_style("é\n\r\n"),
+            EffectiveNewlineStyle::Unix
+        );
+        assert_eq!(
+            auto_detect_newline_style("é\r\n\n"),
+            EffectiveNewlineStyle::Windows
+        );
+    }
 
     #[test]
     fn auto_detects_unix_newlines() {

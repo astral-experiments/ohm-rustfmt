@@ -1,10 +1,13 @@
+use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::fs;
+use std::hash::BuildHasher;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
+use rustc_data_structures::fx::FxHashMap;
 use rustc_data_structures::sync::IntoDynSyncSend;
 use rustc_errors::annotate_snippet_emitter_writer::AnnotateSnippetEmitter;
 use rustc_errors::emitter::{DynEmitter, Emitter, SilentEmitter, stderr_destination};
@@ -28,10 +31,17 @@ use crate::{Config, ErrorKind, FileName};
 /// ParseSess holds structs necessary for constructing a parser.
 pub(crate) struct ParseSess {
     raw_psess: RawParseSess,
+    source_index: RefCell<SourceIndex>,
     ignore_path_set: Arc<IgnorePathSet>,
     can_reset_errors: Arc<AtomicBool>,
     emitted_diagnostics: Arc<AtomicBool>,
     file_probes: Option<Arc<RecordedFileProbes>>,
+}
+
+#[derive(Default)]
+struct SourceIndex {
+    indexed: usize,
+    first: FxHashMap<u64, usize>,
 }
 
 /// One filesystem observation made by rustfmt's real module resolver.
@@ -305,6 +315,7 @@ impl ParseSess {
 
         Ok(ParseSess {
             raw_psess,
+            source_index: RefCell::default(),
             ignore_path_set,
             can_reset_errors,
             emitted_diagnostics,
@@ -368,16 +379,37 @@ impl ParseSess {
         )
     }
 
+    /// The source map only appends files during parsing. Index the new entries
+    /// before each lookup, keeping the first match just like `get_source_file`.
+    fn source_file(&self, name: &rustc_span::FileName) -> Option<Arc<rustc_span::SourceFile>> {
+        let map = self.raw_psess.source_map();
+        let files = map.files();
+        // Small modules don't amortize allocating the index.
+        if files.len() < 32 {
+            return files.iter().find(|file| &file.name == name).cloned();
+        }
+        let mut index = self.source_index.borrow_mut();
+        for i in index.indexed..files.len() {
+            let hash = index.first.hasher().hash_one(&files[i].name);
+            index.first.entry(hash).or_insert(i);
+        }
+        index.indexed = files.len();
+        // Store only indices and hashes to avoid duplicating every path in the
+        // source map. Always check the name, falling back to a scan on collision.
+        let hash = index.first.hasher().hash_one(name);
+        let &first = index.first.get(&hash)?;
+        files[first..]
+            .iter()
+            .find(|file| &file.name == name)
+            .cloned()
+    }
+
     pub(crate) fn is_file_parsed(&self, path: &Path) -> bool {
-        self.raw_psess
-            .source_map()
-            .get_source_file(&rustc_span::FileName::Real(
-                self.raw_psess
-                    .source_map()
-                    .path_mapping()
-                    .to_real_filename(self.raw_psess.source_map().working_dir(), path),
-            ))
-            .is_some()
+        let map = self.raw_psess.source_map();
+        self.source_file(&rustc_span::FileName::Real(
+            map.path_mapping().to_real_filename(map.working_dir(), path),
+        ))
+        .is_some()
     }
 
     pub(crate) fn ignore_file(&self, path: &FileName) -> bool {
@@ -474,9 +506,7 @@ impl ParseSess {
             FileName::Stdin => rustc_span::FileName::Custom("stdin".to_owned()),
         };
 
-        self.raw_psess
-            .source_map()
-            .get_source_file(&rustc_filename)
+        self.source_file(&rustc_filename)
             .and_then(|source_file| source_file.src.clone())
     }
 }
@@ -555,6 +585,41 @@ mod tests {
                 .set_modified(modified)?;
             session.read_source(&path)?;
             assert!(!session.probes_complete());
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn source_lookup_follows_parsing_and_matches_the_first_file() -> io::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let config = Config::default();
+        rustc_span::create_session_if_not_set_then(config.edition().into(), |_| {
+            let session = ParseSess::new(&config, None).map_err(io::Error::other)?;
+            let map = session.inner().source_map();
+            for i in 0..50 {
+                let path = directory.path().join(format!("m{i}.rs"));
+                assert!(!session.is_file_parsed(&path));
+                fs::write(&path, format!("// {i}\n"))?;
+                map.load_file(&path)?;
+                assert!(session.is_file_parsed(&path));
+            }
+            for i in (0..50).rev() {
+                let path = directory.path().join(format!("./m{i}.rs"));
+                let name = rustc_span::FileName::Real(
+                    map.path_mapping()
+                        .to_real_filename(map.working_dir(), &path),
+                );
+                // Simulate a hash collision with an earlier file.
+                if i == 37 {
+                    let mut index = session.source_index.borrow_mut();
+                    let hash = index.first.hasher().hash_one(&name);
+                    index.first.insert(hash, 0);
+                }
+                let expected = map.get_source_file(&name).unwrap();
+                assert!(Arc::ptr_eq(&expected, &session.source_file(&name).unwrap()));
+                let snippet = session.get_original_snippet(&FileName::Real(path)).unwrap();
+                assert_eq!(snippet.as_str(), format!("// {i}\n"));
+            }
             Ok(())
         })
     }
