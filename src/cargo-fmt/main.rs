@@ -563,6 +563,7 @@ fn run_rustfmt(
 enum RustfmtOutputMode {
     Inherit,
     DeferDiagnostics,
+    ForwardDiagnostics,
     CaptureQuietly,
 }
 
@@ -668,7 +669,12 @@ fn run_rustfmt_with_output(
             })?;
 
         let diagnostics = match child.stderr.take() {
-            Some(mut pipe) if output_mode == RustfmtOutputMode::Inherit => {
+            Some(mut pipe)
+                if matches!(
+                    output_mode,
+                    RustfmtOutputMode::Inherit | RustfmtOutputMode::ForwardDiagnostics
+                ) =>
+            {
                 io::copy(&mut pipe, &mut io::stderr().lock())
             }
             Some(mut pipe) if output_mode == RustfmtOutputMode::DeferDiagnostics => {
@@ -680,7 +686,8 @@ fn run_rustfmt_with_output(
         let edition_status = child.wait()?;
         emitted_diagnostics |= diagnostics? != 0;
         if !edition_status.success() {
-            status = status.or_else(|| edition_status.code());
+            // On Unix a signaled child has no exit code. Preserve the first failure.
+            status.get_or_insert(edition_status.code().unwrap_or(FAILURE));
         }
     }
 

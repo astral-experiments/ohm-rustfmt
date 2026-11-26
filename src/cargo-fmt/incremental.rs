@@ -45,6 +45,8 @@ pub(super) struct Snapshot {
     invocation: String,
     configuration: BTreeMap<String, String>,
     packages: BTreeMap<String, PackageSnapshot>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    source_digests: BTreeMap<String, String>,
 }
 
 /// Associates each target with its parser-loaded sources and native resolution probes.
@@ -78,6 +80,8 @@ struct ModuleManifest {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ModuleRoot {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    source_digest: Option<String>,
     path: String,
     files: Vec<String>,
     leaves: BTreeMap<String, String>,
@@ -98,6 +102,7 @@ struct ModuleProbe {
 /// Complete native source and probe graphs returned by one or more formatter processes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Discovery {
+    source_digests: BTreeMap<String, String>,
     modules: ModuleGraph,
     leaves: LeafGraph,
     probes: ProbeGraph,
@@ -195,7 +200,7 @@ pub(super) fn format(
         }
     };
 
-    let mut changed_roots = plan.changed_targets();
+    let mut changed_roots = plan.changed_targets(arguments);
     if changed_roots.is_empty() {
         trace(&format!(
             "cache hit: {} unchanged packages",
@@ -219,6 +224,24 @@ pub(super) fn format(
         return run_rustfmt(targets, arguments, verbosity);
     }
 
+    // Preserve the piped stderr of an ordinary incremental check, even if stderr
+    // is a terminal. Replaying without a manifest would otherwise enable colors.
+    let replay_check = || {
+        run_rustfmt_with_output(
+            targets,
+            arguments,
+            verbosity,
+            RustfmtOutputMode::ForwardDiagnostics,
+            None,
+            None,
+        )
+        .map(|output| output.status)
+    };
+    let combined = changed_targets.len() < targets.len()
+        && plan
+            .previous
+            .as_ref()
+            .is_some_and(|previous| previous.configuration != plan.current.configuration);
     let changed_packages: BTreeSet<_> = changed_targets
         .iter()
         .map(|target| target.package_root.as_path())
@@ -260,7 +283,7 @@ pub(super) fn format(
         &changed_targets,
         arguments,
         verbosity,
-        if batch {
+        if batch || combined {
             RustfmtOutputMode::CaptureQuietly
         } else if partial_write {
             RustfmtOutputMode::DeferDiagnostics
@@ -271,6 +294,10 @@ pub(super) fn format(
         requested_modules.as_deref(),
     )?;
     if output.status != SUCCESS || output.emitted_diagnostics {
+        if combined {
+            trace("reformatting all targets after an unsuccessful partial check");
+            return replay_check();
+        }
         // Rustfmt can write through an alias before reporting a warning or error.
         // Only print the diagnostics of the run whose result we return.
         if partial_write && plan.current.skipped_source_changed(&changed_roots, None) {
@@ -333,6 +360,7 @@ pub(super) fn format(
         // Reuse the cached graph only after validating that the requested leaf
         // alone changed, a read-only pass proves it clean, and the full snapshot is stable.
         Discovery {
+            source_digests: BTreeMap::new(),
             modules: ModuleGraph::new(),
             leaves: LeafGraph::new(),
             probes: ProbeGraph::new(),
@@ -346,6 +374,10 @@ pub(super) fn format(
                 // a module shared with a target we left out of this invocation.
                 if partial_write && plan.current.skipped_source_changed(&changed_roots, None) {
                     return reformat_all();
+                }
+                if combined {
+                    trace("reformatting all targets without an authoritative partial check");
+                    return replay_check();
                 }
                 if changed_leaves.is_some() {
                     trace(&format!(
@@ -400,7 +432,7 @@ pub(super) fn format(
     modules.extend(discovered.modules);
     leaves.extend(discovered.leaves);
     probes.extend(discovered.probes);
-    match Snapshot::capture(
+    let snapshot = Snapshot::capture(
         targets,
         arguments,
         manifest_path,
@@ -408,7 +440,26 @@ pub(super) fn format(
         &leaves,
         &probes,
         None,
-    ) {
+    );
+    // A skipped target may have changed while the formatter was running.
+    // Revalidate both the snapshot and the byte proofs before accepting a
+    // partial result across a Cargo configuration edit.
+    if combined
+        && changed_targets.len() < targets.len()
+        && !snapshot.as_ref().is_ok_and(|updated| {
+            plan.confirm_partial_check(updated, &changed_roots, arguments)
+                && updated.probe_graph() == probes
+                && updated.matches_source_inputs(&modules)
+        })
+    {
+        trace("reformatting all targets after a concurrent partial-check input change");
+        let status = replay_check()?;
+        if status == SUCCESS {
+            plan.discard_previous_graph();
+        }
+        return Ok(status);
+    }
+    match snapshot {
         Ok(updated)
             if plan.can_record(&updated, &changed_roots, check_only || unchanged)
                 && updated.matches_probes(&probes)
@@ -431,6 +482,13 @@ pub(super) fn format(
                     trace("caching a clean read-only formatter pass without reverification");
                 } else {
                     trace("caching an unchanged formatter pass without reverification");
+                }
+                let mut updated = updated;
+                if arguments == ["--check"]
+                    && changed_targets == *targets
+                    && changed_leaves.is_none()
+                {
+                    updated.source_digests = discovered.source_digests;
                 }
                 if let Err(error) = write_cache(&plan.cache_path, &updated) {
                     trace(&format!("could not update the formatting cache: {error}"));
@@ -537,6 +595,9 @@ pub(super) fn format(
             match snapshot {
                 Ok(_) => trace("not caching files changed concurrently with formatting"),
                 Err(error) => trace(&format!("could not verify formatted files: {error}")),
+            }
+            if check_only {
+                plan.discard_previous_graph();
             }
             if rewritten_leaf {
                 return run_rustfmt(&changed_targets, arguments, verbosity);
@@ -751,6 +812,19 @@ fn verification_arguments(arguments: &[String]) -> Vec<String> {
 }
 
 impl Plan {
+    /// Removing a module declaration without deleting its file can make the old graph
+    /// disagree with every successful check. Keep the concurrent-edit guards, but let
+    /// the next check rediscover its inputs from scratch. The cache lock is still held.
+    fn discard_previous_graph(&self) {
+        if self.previous.is_some() {
+            if let Err(error) = fs::remove_file(&self.cache_path) {
+                trace(&format!(
+                    "could not discard the old formatting graph: {error}"
+                ));
+            }
+        }
+    }
+
     /// Restores a matching snapshot, falling back to root-only discovery if its graph vanished.
     fn prepare(
         targets: &BTreeSet<Target>,
@@ -804,7 +878,7 @@ impl Plan {
     }
 
     /// Expands invalidations transitively across targets that share parser-loaded files.
-    fn changed_targets(&self) -> BTreeSet<&str> {
+    fn changed_targets(&self, arguments: &[String]) -> BTreeSet<&str> {
         let all = || {
             self.current
                 .packages
@@ -818,7 +892,7 @@ impl Plan {
         };
         if previous.version != CACHE_VERSION
             || previous.invocation != self.current.invocation
-            || previous.configuration != self.current.configuration
+            || !previous.same_formatter_configuration(&self.current, arguments)
             || previous.packages.len() != self.current.packages.len()
         {
             return all();
@@ -874,6 +948,20 @@ impl Plan {
             }
             changed.extend(additional);
         }
+    }
+
+    fn confirm_partial_check(
+        &self,
+        updated: &Snapshot,
+        changed: &BTreeSet<&str>,
+        arguments: &[String],
+    ) -> bool {
+        updated.configuration == self.current.configuration
+            && self.can_record(updated, changed, true)
+            && self
+                .previous
+                .as_ref()
+                .is_some_and(|previous| previous.same_formatter_configuration(updated, arguments))
     }
 
     /// Selects verified direct leaves changed since the last clean invocation.
@@ -1031,6 +1119,91 @@ struct TargetGraph<'a, Paths> {
 }
 
 impl Snapshot {
+    fn source_digest(sources: &BTreeMap<String, SourceFingerprint>) -> io::Result<String> {
+        let mut digest = Sha256::new();
+        for path in sources.keys() {
+            let mut source = blake3::Hasher::new();
+            // A regular module can be replaced after we capture its metadata.
+            // Do not wait for a FIFO writer while holding the snapshot lock.
+            let mut options = OpenOptions::new();
+            options.read(true);
+            #[cfg(unix)]
+            options.custom_flags(rustix::fs::OFlags::NONBLOCK.bits() as i32);
+            let file = options.open(path)?;
+            if !file.metadata()?.is_file() {
+                return Err(unsupported("the module is no longer a regular file"));
+            }
+            source.update_reader(file)?;
+            digest.update(source.finalize().as_bytes());
+        }
+        Ok(format!("{:x}", digest.finalize()))
+    }
+
+    #[cfg(test)]
+    fn record_source_digests(&mut self) {
+        for package in self.packages.values() {
+            for (root, sources) in &package.targets {
+                if let Ok(digest) = Self::source_digest(sources) {
+                    self.source_digests.insert(root.clone(), digest);
+                }
+            }
+        }
+    }
+
+    /// Cargo metadata is fresh and the invocation binds the effective targets and editions.
+    /// For combined Cargo and source edits, skip a target only with proof of the original
+    /// parser bytes. Never carry this proof forward from a partially checked snapshot.
+    fn same_formatter_configuration(&self, other: &Self, arguments: &[String]) -> bool {
+        if self.configuration == other.configuration {
+            return true;
+        }
+        if self.source_digests.is_empty()
+            || arguments != ["--check"]
+            || self.invocation != other.invocation
+            || self.configuration.len() != other.configuration.len()
+        {
+            return false;
+        }
+
+        for ((path, old), (other_path, new)) in self.configuration.iter().zip(&other.configuration)
+        {
+            if path != other_path {
+                return false;
+            }
+            if old == new {
+                continue;
+            }
+            if !matches!(
+                Path::new(path).file_name().and_then(|name| name.to_str()),
+                Some("Cargo.toml" | "Cargo.lock")
+            ) || !matches!(
+                (old.rsplit_once(':'), new.rsplit_once(':')),
+                (Some((a, _)), Some((b, _))) if a == b
+            ) {
+                return false;
+            }
+        }
+        if !other.packages.iter().any(|(name, package)| {
+            self.packages
+                .get(name)
+                .is_some_and(|old| old.targets != package.targets)
+        }) {
+            return false;
+        }
+        for (name, package) in &other.packages {
+            for (root, sources) in &package.targets {
+                let previous = self.packages.get(name).and_then(|p| p.targets.get(root));
+                if previous == Some(sources)
+                    && !Self::source_digest(sources)
+                        .is_ok_and(|digest| self.source_digests.get(root) == Some(&digest))
+                {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
     /// Identifies the expected configuration for each file in rustfmt's argument
     /// order using the configuration files already captured in this snapshot.
     pub(super) fn configuration_digest(&self, files: &[&PathBuf], arguments: &[String]) -> String {
@@ -1218,6 +1391,7 @@ impl Snapshot {
         }
 
         Ok(Self {
+            source_digests: BTreeMap::new(),
             version: CACHE_VERSION,
             invocation: match invocation {
                 Some(invocation) => invocation.to_owned(),
@@ -1367,6 +1541,7 @@ fn read_module_manifests(paths: &[PathBuf], targets: &BTreeSet<Target>) -> io::R
         .collect::<io::Result<_>>()?;
     let mut roots = ModuleGraph::new();
     let mut leaf_roots = LeafGraph::new();
+    let mut source_digests = BTreeMap::new();
     let mut probe_roots = ProbeGraph::new();
     let mut unchanged = true;
     for path in paths {
@@ -1481,6 +1656,12 @@ fn read_module_manifests(paths: &[PathBuf], targets: &BTreeSet<Target>) -> io::R
             }
             probe_roots.insert(root.path.clone(), observations);
             leaf_roots.insert(root.path.clone(), leaves);
+            if let Some(digest) = root.source_digest {
+                if !valid_topology_digest(&digest) {
+                    return Err(unsupported("invalid source digest"));
+                }
+                source_digests.insert(root.path.clone(), digest);
+            }
             roots.insert(root.path, observed_dependencies);
         }
     }
@@ -1492,6 +1673,7 @@ fn read_module_manifests(paths: &[PathBuf], targets: &BTreeSet<Target>) -> io::R
     }
 
     Ok(Discovery {
+        source_digests,
         modules: roots,
         leaves: leaf_roots,
         probes: probe_roots,
@@ -1739,7 +1921,16 @@ fn trusted_formatter() -> io::Result<(PathBuf, PathBuf)> {
         ));
     }
 
-    let path = PathBuf::from(rustfmt_command().get_program()).canonicalize()?;
+    let command = rustfmt_command();
+    let program = Path::new(command.get_program());
+    // A bare RUSTFMT name is looked up on PATH when spawning the child.
+    // Canonicalizing it here would instead trust a file in the working directory.
+    if !program.is_absolute() {
+        return Err(unsupported(
+            "a relative rustfmt executable cannot be cached safely",
+        ));
+    }
+    let path = program.canonicalize()?;
     let expected_formatter = if cfg!(windows) {
         "rustfmt.exe"
     } else {
@@ -2225,6 +2416,7 @@ mod tests {
 
     fn snapshot(files: &[(&str, &[(&str, &str)])]) -> Snapshot {
         Snapshot {
+            source_digests: BTreeMap::new(),
             version: CACHE_VERSION,
             invocation: String::from("formatter-and-arguments"),
             configuration: BTreeMap::from([(
@@ -2295,6 +2487,33 @@ mod tests {
         fs::write(&unrelated, "shared data").unwrap();
         fs::hard_link(&unrelated, &lock).unwrap();
         assert!(lock_cache_file(&lock).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn source_digest_rejects_a_module_replaced_by_a_fifo() -> io::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("child.rs");
+        fs::write(&path, "")?;
+        let fingerprint = SourceFingerprint::from_metadata(&fs::metadata(&path)?)?;
+        let sources = BTreeMap::from([(path_string(&path)?, fingerprint)]);
+        fs::remove_file(&path)?;
+        assert!(
+            std::process::Command::new("mkfifo")
+                .arg(&path)
+                .status()?
+                .success()
+        );
+
+        let (send, receive) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = send.send(Snapshot::source_digest(&sources));
+        });
+        let result = receive
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("source digest blocked without a FIFO writer");
+        assert!(result.is_err());
+        Ok(())
     }
 
     #[cfg(unix)]
@@ -2487,7 +2706,7 @@ mod tests {
         let current = snapshot(&[("/workspace/first", &[("src/lib.rs", "formatted")])]);
         let plan = plan(Some(current.clone()), current);
 
-        assert!(plan.changed_targets().is_empty());
+        assert!(plan.changed_targets(&[]).is_empty());
     }
 
     #[test]
@@ -2717,7 +2936,7 @@ mod tests {
         let plan = plan(Some(previous), current);
 
         assert_eq!(
-            plan.changed_targets(),
+            plan.changed_targets(&[]),
             BTreeSet::from(["/workspace/first/src/lib.rs"])
         );
     }
@@ -2739,7 +2958,7 @@ mod tests {
         let plan = plan(Some(previous), current);
 
         assert_eq!(
-            plan.changed_leaves(&plan.changed_targets()),
+            plan.changed_leaves(&plan.changed_targets(&[])),
             Some(vec![ChangedLeaf {
                 root: String::from("/workspace/first/src/lib.rs"),
                 path: String::from(leaf),
@@ -2782,7 +3001,7 @@ mod tests {
         let plan = plan(Some(previous), current);
 
         assert_eq!(
-            plan.changed_leaves(&plan.changed_targets()),
+            plan.changed_leaves(&plan.changed_targets(&[])),
             Some(vec![
                 ChangedLeaf {
                     root: String::from("/workspace/first/src/lib.rs"),
@@ -2872,7 +3091,7 @@ mod tests {
             authorize_leaf(&mut current, package, leaf);
         }
         let plan = plan(Some(previous), current);
-        assert!(plan.changed_leaves(&plan.changed_targets()).is_none());
+        assert!(plan.changed_leaves(&plan.changed_targets(&[])).is_none());
     }
 
     #[test]
@@ -2902,7 +3121,7 @@ mod tests {
         let plan = plan(Some(previous), current);
 
         assert_eq!(
-            plan.changed_targets(),
+            plan.changed_targets(&[]),
             BTreeSet::from([
                 "/workspace/first/src/lib.rs",
                 "/workspace/second/src/lib.rs"
@@ -2941,7 +3160,7 @@ mod tests {
 
         let plan = plan(Some(previous), current);
         assert_eq!(
-            plan.changed_targets(),
+            plan.changed_targets(&[]),
             BTreeSet::from(["/workspace/first/src/lib.rs"])
         );
     }
@@ -2977,7 +3196,7 @@ mod tests {
 
         let plan = plan(Some(previous), current);
         assert_eq!(
-            plan.changed_targets(),
+            plan.changed_targets(&[]),
             BTreeSet::from(["/workspace/first/src/lib.rs"])
         );
     }
@@ -3029,6 +3248,7 @@ mod tests {
             &[("src/lib.rs", "root"), ("src/nested.rs", "module")],
         )]);
         let mut discovery = Discovery {
+            source_digests: BTreeMap::new(),
             modules: checked.module_graph(),
             leaves: checked.leaf_graph(),
             probes: checked.probe_graph(),
@@ -3103,7 +3323,7 @@ mod tests {
 
         let plan = plan(Some(previous), current);
         assert_eq!(
-            plan.changed_targets(),
+            plan.changed_targets(&[]),
             BTreeSet::from([
                 "/workspace/first/src/lib.rs",
                 "/workspace/second/src/lib.rs",
@@ -3163,13 +3383,82 @@ mod tests {
         let deletion = plan(Some(added), previous);
 
         assert_eq!(
-            addition.changed_targets(),
+            addition.changed_targets(&[]),
             BTreeSet::from(["/workspace/first/src/lib.rs"])
         );
         assert_eq!(
-            deletion.changed_targets(),
+            deletion.changed_targets(&[]),
             BTreeSet::from(["/workspace/first/src/lib.rs"])
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cargo_input_edits_can_preserve_disjoint_read_only_formatter_targets() -> io::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let root = dir.path().to_str().unwrap();
+        let source = dir.path().join("lib.rs");
+        fs::write(&source, "")?;
+        let second = dir.path().join("second");
+        fs::create_dir(&second)?;
+        let other = second.to_str().unwrap();
+        fs::write(second.join("lib.rs"), "")?;
+        let mut old = snapshot(&[
+            (root, &[("lib.rs", "unchanged")]),
+            (other, &[("lib.rs", "unchanged")]),
+        ]);
+        let mut new = old.clone();
+        for name in ["Cargo.lock", "Cargo.toml"] {
+            let path = format!("{root}/{name}");
+            fs::write(&path, "")?;
+            old.configuration.insert(path.clone(), format!("{path}:1"));
+            new.configuration.insert(path.clone(), format!("{path}:2"));
+        }
+        let check = [String::from("--check")];
+        let mut plan = plan(Some(old), new);
+        assert_eq!(plan.changed_targets(&check).len(), 2);
+        plan.previous.as_mut().unwrap().record_source_digests();
+        assert_eq!(plan.changed_targets(&check).len(), 2);
+        let edited = plan.current.packages.get_mut(other).unwrap();
+        *edited
+            .targets
+            .values_mut()
+            .next()
+            .unwrap()
+            .values_mut()
+            .next()
+            .unwrap() = fingerprint("edited");
+        assert_eq!(plan.changed_targets(&check).len(), 1);
+        // Model a skipped input changed after selection without changing its
+        // metadata fingerprint. Reject the entire partial result.
+        let changed = plan.changed_targets(&check);
+        assert!(plan.confirm_partial_check(&plan.current, &changed, &check));
+        fs::write(&source, "fn f( ){}")?;
+        assert!(!plan.confirm_partial_check(&plan.current, &changed, &check));
+        fs::write(&source, "")?;
+        assert_eq!(plan.changed_targets(&[]).len(), 2);
+        assert_eq!(
+            plan.changed_targets(&["--check".into(), "--config-path=Cargo.lock".into()])
+                .len(),
+            2
+        );
+        plan.current.invocation.push('!');
+        assert_eq!(plan.changed_targets(&check).len(), 2);
+        plan.current.invocation.pop();
+
+        let lock = format!("{root}/Cargo.lock");
+        plan.current
+            .configuration
+            .insert(lock.clone(), "other:2".into());
+        assert_eq!(plan.changed_targets(&check).len(), 2);
+        plan.current
+            .configuration
+            .insert(lock.clone(), format!("{lock}:2"));
+        fs::remove_file(&lock)?;
+        fs::hard_link(&source, &lock)?;
+        fs::write(&lock, "fn f( ){}")?;
+        assert_eq!(plan.changed_targets(&check).len(), 2);
+        Ok(())
     }
 
     #[test]
@@ -3186,7 +3475,7 @@ mod tests {
         let plan = plan(Some(previous), current);
 
         assert_eq!(
-            plan.changed_targets(),
+            plan.changed_targets(&[]),
             BTreeSet::from([
                 "/workspace/first/src/lib.rs",
                 "/workspace/second/src/lib.rs"
@@ -3775,6 +4064,7 @@ mod tests {
                 version: MODULE_MANIFEST_VERSION,
                 unchanged: true,
                 roots: vec![ModuleRoot {
+                    source_digest: None,
                     path: path_string(&root)?,
                     files: vec![path_string(&root)?, path_string(&generated)?],
                     leaves: BTreeMap::from([(path_string(&generated)?, format!("{:064x}", 1))]),
@@ -3836,6 +4126,7 @@ mod tests {
                 version: MODULE_MANIFEST_VERSION,
                 unchanged: true,
                 roots: vec![ModuleRoot {
+                    source_digest: None,
                     path: path_string(&root)?,
                     files: vec![],
                     leaves: BTreeMap::new(),
@@ -3887,6 +4178,7 @@ mod tests {
                 version: MODULE_MANIFEST_VERSION,
                 unchanged: true,
                 roots: vec![ModuleRoot {
+                    source_digest: None,
                     path: root_path.clone(),
                     files: vec![root_path.clone(), root_path.clone()],
                     leaves: BTreeMap::new(),
@@ -3905,6 +4197,7 @@ mod tests {
                 version: MODULE_MANIFEST_VERSION,
                 unchanged: true,
                 roots: vec![ModuleRoot {
+                    source_digest: None,
                     path: root_path.clone(),
                     files: vec![root_path.clone()],
                     leaves: BTreeMap::new(),
@@ -3917,6 +4210,7 @@ mod tests {
 
         let duplicate_roots = package.join("duplicate-roots.json");
         let record = ModuleRoot {
+            source_digest: None,
             path: root_path.clone(),
             files: vec![root_path.clone()],
             leaves: BTreeMap::new(),
@@ -3942,6 +4236,7 @@ mod tests {
                 version: MODULE_MANIFEST_VERSION,
                 unchanged: true,
                 roots: vec![ModuleRoot {
+                    source_digest: None,
                     path: path_string(&root)?,
                     files: vec![path_string(&root)?],
                     leaves: BTreeMap::new(),
@@ -3969,6 +4264,7 @@ mod tests {
                 version: MODULE_MANIFEST_VERSION,
                 unchanged: true,
                 roots: vec![ModuleRoot {
+                    source_digest: None,
                     path: path_string(&root)?,
                     files: vec![String::from("lib.rs")],
                     leaves: BTreeMap::new(),
@@ -3998,6 +4294,7 @@ mod tests {
                 version: MODULE_MANIFEST_VERSION,
                 unchanged: true,
                 roots: vec![ModuleRoot {
+                    source_digest: None,
                     path: path_string(&root)?,
                     files: vec![path_string(&root)?, path_string(&module)?],
                     leaves: BTreeMap::new(),
@@ -4026,6 +4323,7 @@ mod tests {
                 version: MODULE_MANIFEST_VERSION,
                 unchanged: true,
                 roots: vec![ModuleRoot {
+                    source_digest: None,
                     path: path_string(&root)?,
                     files: vec![path_string(&root)?],
                     leaves: BTreeMap::new(),
