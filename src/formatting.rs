@@ -8,7 +8,7 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use rustc_ast::ast;
-use rustc_span::Span;
+use rustc_span::{SourceFileHashAlgorithm, Span};
 use tracing::debug;
 
 use self::newline_style::apply_newline_style;
@@ -105,7 +105,7 @@ fn format_leaf_project<T: FormatHandler>(
     // accepted parse so clean leaves do not need a second root/module parse.
     let mut configuration = config.clone();
     configuration.set().show_parse_errors(false);
-    let psess = ParseSess::new(&configuration, true)?;
+    let psess = ParseSess::new(&configuration, Some(SourceFileHashAlgorithm::Md5))?;
     let Ok(krate) = Parser::parse_crate(Input::File(root.to_owned()), &psess) else {
         return Ok(None);
     };
@@ -272,7 +272,16 @@ fn format_project<T: FormatHandler>(
     let main_file = input.file_name();
     let input_is_stdin = main_file == FileName::Stdin;
 
-    let psess = ParseSess::new(config, handler.module_graph_enabled())?;
+    // Only read-only root checks publish content proofs for manifest edits.
+    let recording =
+        handler
+            .module_graph_enabled()
+            .then_some(if config.emit_mode() == EmitMode::Diff {
+                SourceFileHashAlgorithm::Blake3
+            } else {
+                SourceFileHashAlgorithm::Md5
+            });
+    let psess = ParseSess::new(config, recording)?;
     if config.skip_children() && psess.ignore_file(&main_file) {
         return Ok(FormatReport::new());
     }
@@ -319,7 +328,7 @@ fn format_project<T: FormatHandler>(
             direct_root_module_topology(&krate, root, path, module).map(|topology| (file, topology))
         }),
         loaded_sources.iter().map(|source| match &source.name {
-            rustc_span::FileName::Real(path) => path.local_path(),
+            rustc_span::FileName::Real(path) => path.local_path().map(|p| (p, source.src_hash)),
             _ => None,
         }),
         context.psess.file_probes(),
@@ -500,7 +509,7 @@ trait FormatHandler {
         root: &FileName,
         files: impl Iterator<Item = &'a FileName>,
         leaves: impl Iterator<Item = (&'l FileName, String)>,
-        dependencies: impl Iterator<Item = Option<&'d Path>>,
+        dependencies: impl Iterator<Item = Option<(&'d Path, rustc_span::SourceFileHash)>>,
         probes: Option<Vec<FileProbe>>,
     );
 
@@ -527,7 +536,7 @@ impl<'b, T: Write + 'b> FormatHandler for Session<'b, T> {
         root: &FileName,
         files: impl Iterator<Item = &'a FileName>,
         leaves: impl Iterator<Item = (&'l FileName, String)>,
-        dependencies: impl Iterator<Item = Option<&'d Path>>,
+        dependencies: impl Iterator<Item = Option<(&'d Path, rustc_span::SourceFileHash)>>,
         probes: Option<Vec<FileProbe>>,
     ) {
         Session::record_module_graph(self, root, files, leaves, dependencies, probes);

@@ -467,8 +467,26 @@ struct ResolvedModuleGraph {
 struct ResolvedRootFiles {
     files: BTreeSet<PathBuf>,
     leaves: BTreeMap<PathBuf, String>,
-    dependencies: BTreeSet<PathBuf>,
+    dependencies: BTreeMap<PathBuf, rustc_span::SourceFileHash>,
     probes: BTreeMap<PathBuf, FileProbe>,
+}
+
+impl ResolvedRootFiles {
+    // Each hash covers the actual parser input before BOM and CRLF normalization.
+    // Match the wrapper's UTF-8 string order, which can differ from Path ordering.
+    fn source_digest(&self) -> Option<String> {
+        use sha2::{Digest, Sha256};
+        let mut files: Vec<_> = self.dependencies.iter().collect();
+        files.sort_unstable_by_key(|(path, _)| path.as_os_str());
+        let mut digest = Sha256::new();
+        for (_, hash) in files {
+            if hash.kind != rustc_span::SourceFileHashAlgorithm::Blake3 {
+                return None;
+            }
+            digest.update(hash.hash_bytes());
+        }
+        Some(format!("{:x}", digest.finalize()))
+    }
 }
 
 /// Versioned handoff consumed by incremental cargo-fmt after a successful formatter run.
@@ -482,6 +500,8 @@ struct ModuleGraphManifest<'a> {
 
 #[derive(serde::Serialize)]
 struct ModuleGraphRoot<'a> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source_digest: Option<String>,
     path: &'a Path,
     files: Vec<&'a Path>,
     leaves: BTreeMap<&'a Path, &'a str>,
@@ -535,21 +555,6 @@ struct CertifiedModule<'a> {
     leaf: PathBuf,
     topology: &'a str,
     inputs: LeafInputs,
-}
-
-/// Rejects unresolved and non-UTF-8 paths that cannot be represented in a cache manifest.
-fn canonical_graph_path(path: &Path) -> Option<PathBuf> {
-    let canonical = path_utils::canonicalize(path).ok()?;
-    canonical.to_str().is_some().then_some(canonical)
-}
-
-/// Canonicalizes all native sources, failing the entire graph if any source is unavailable.
-fn canonical_graph_paths<'a>(
-    paths: impl Iterator<Item = Option<&'a Path>>,
-) -> Option<BTreeSet<PathBuf>> {
-    paths
-        .map(|path| path.and_then(canonical_graph_path))
-        .collect()
 }
 
 impl<'b, T: Write + 'b> Session<'b, T> {
@@ -677,7 +682,7 @@ impl<'b, T: Write + 'b> Session<'b, T> {
         root: &FileName,
         files: impl Iterator<Item = &'a FileName>,
         leaves: impl Iterator<Item = (&'l FileName, String)>,
-        dependencies: impl Iterator<Item = Option<&'d Path>>,
+        dependencies: impl Iterator<Item = Option<(&'d Path, rustc_span::SourceFileHash)>>,
         probes: Option<Vec<FileProbe>>,
     ) {
         let Some(graph) = self.module_graph.as_mut() else {
@@ -687,38 +692,11 @@ impl<'b, T: Write + 'b> Session<'b, T> {
             graph.complete = false;
             return;
         };
-        let Some(root) = canonical_graph_path(root) else {
-            graph.complete = false;
-            return;
-        };
-        let Some(resolved_files) = canonical_graph_paths(files.map(|file| match file {
-            FileName::Real(path) => Some(path.as_path()),
-            _ => None,
-        })) else {
-            graph.complete = false;
-            return;
-        };
-        let Some(resolved_leaves) = leaves
-            .map(|(file, topology)| match file {
-                FileName::Real(path) => canonical_graph_path(path).map(|path| (path, topology)),
-                _ => None,
-            })
-            .collect::<Option<BTreeMap<_, _>>>()
-        else {
-            graph.complete = false;
-            return;
-        };
-        let Some(loaded_dependencies) = canonical_graph_paths(dependencies) else {
-            graph.complete = false;
-            return;
-        };
-
         let Some(probes) = probes else {
             graph.complete = false;
             return;
         };
         let mut resolved_probes = BTreeMap::new();
-        let mut observed_dependencies = BTreeSet::new();
         for probe in probes {
             if !probe.path.is_absolute()
                 || probe.path.to_str().is_none()
@@ -732,10 +710,63 @@ impl<'b, T: Write + 'b> Session<'b, T> {
                 graph.complete = false;
                 return;
             }
-            if let Some(canonical) = &probe.canonical {
-                observed_dependencies.insert(canonical.clone());
-            }
             if resolved_probes.insert(probe.path.clone(), probe).is_some() {
+                graph.complete = false;
+                return;
+            }
+        }
+
+        // Use the logical-to-canonical mapping from the parser's reads. Resolving
+        // paths again could attach a hash to a different file after a symlink edit.
+        let observed_source = |path: &Path| {
+            let probe = if path.is_absolute() {
+                resolved_probes.get(path)
+            } else {
+                resolved_probes.get(&std::env::current_dir().ok()?.join(path))
+            }?;
+            probe.canonical.clone()
+        };
+        let Some(root) = observed_source(root) else {
+            graph.complete = false;
+            return;
+        };
+        let Some(resolved_files) = files
+            .map(|file| match file {
+                FileName::Real(path) => observed_source(path),
+                _ => None,
+            })
+            .collect::<Option<BTreeSet<_>>>()
+        else {
+            graph.complete = false;
+            return;
+        };
+        let Some(resolved_leaves) = leaves
+            .map(|(file, topology)| match file {
+                FileName::Real(path) => observed_source(path).map(|path| (path, topology)),
+                _ => None,
+            })
+            .collect::<Option<BTreeMap<_, _>>>()
+        else {
+            graph.complete = false;
+            return;
+        };
+        let mut loaded_dependencies = BTreeSet::new();
+        let resolved = graph.roots.entry(root.clone()).or_default();
+        for dependency in dependencies {
+            let Some((path, hash)) = dependency else {
+                graph.complete = false;
+                return;
+            };
+            let Some(path) = observed_source(path) else {
+                graph.complete = false;
+                return;
+            };
+            loaded_dependencies.insert(path.clone());
+            if resolved
+                .dependencies
+                .insert(path, hash)
+                .is_some_and(|old| old != hash)
+            {
                 graph.complete = false;
                 return;
             }
@@ -746,15 +777,12 @@ impl<'b, T: Write + 'b> Session<'b, T> {
                 .keys()
                 .any(|path| !resolved_files.contains(path))
             || !resolved_files.is_subset(&loaded_dependencies)
-            || !loaded_dependencies.is_subset(&observed_dependencies)
         {
             graph.complete = false;
             return;
         }
-        let resolved = graph.roots.entry(root).or_default();
         resolved.files.extend(resolved_files);
         resolved.leaves.extend(resolved_leaves);
-        resolved.dependencies.extend(loaded_dependencies);
         for (path, probe) in resolved_probes {
             if let Some(previous) = resolved.probes.insert(path, probe.clone()) {
                 if previous != probe {
@@ -802,7 +830,8 @@ impl<'b, T: Write + 'b> Session<'b, T> {
                         .iter()
                         .map(|(path, topology)| (path.as_path(), topology.as_str()))
                         .collect(),
-                    dependencies: resolved.dependencies.iter().map(PathBuf::as_path).collect(),
+                    source_digest: resolved.source_digest(),
+                    dependencies: resolved.dependencies.keys().map(PathBuf::as_path).collect(),
                     probes: resolved.probes.values().collect(),
                 })
                 .collect(),
@@ -1024,6 +1053,85 @@ impl Input {
 mod unit_tests {
     use super::*;
 
+    fn parsed_source(path: &Path) -> Option<(&Path, rustc_span::SourceFileHash)> {
+        let bytes = fs::read(path).ok()?;
+        let hash = rustc_span::SourceFileHash::new_in_memory(
+            rustc_span::SourceFileHashAlgorithm::Blake3,
+            bytes,
+        );
+        Some((path, hash))
+    }
+
+    #[test]
+    fn check_proof_uses_parser_bytes_before_normalization_or_later_edits() -> io::Result<()> {
+        use sha2::{Digest, Sha256};
+
+        let directory = tempfile::tempdir()?;
+        let root = directory.path().join("root.rs");
+        let source = "fn formatted() {}\r\n";
+        fs::write(&root, source)?;
+        let mut config = Config::default();
+        config.set().emit_mode(EmitMode::Diff);
+        let mut output = Vec::new();
+        let mut session = Session::new(config, Some(&mut output));
+        session.enable_module_graph();
+        session
+            .format(Input::File(root.clone()))
+            .map_err(io::Error::other)?;
+        fs::write(&root, "fn formatted( ){}\r\n")?;
+        let manifest = directory.path().join("modules.json");
+        session.write_module_manifest(&manifest, &[root])?;
+        let graph: serde_json::Value =
+            serde_json::from_slice(&fs::read(manifest)?).map_err(io::Error::other)?;
+        let expected = format!(
+            "{:x}",
+            Sha256::digest(blake3::hash(source.as_bytes()).as_bytes())
+        );
+        assert_eq!(graph["roots"][0]["source_digest"], expected);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn retargeting_a_parsed_alias_cannot_erase_a_dependency() -> io::Result<()> {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir()?;
+        let root = directory.path().join("lib.rs");
+        let alias = directory.path().join("a.rs");
+        let other = directory.path().join("b.rs");
+        let original = directory.path().join("original.rs");
+        fs::write(&root, "mod a;\nmod b;\n")?;
+        for path in [&original, &other] {
+            fs::write(path, "fn f() {}\n")?;
+        }
+        symlink(&original, &alias)?;
+        let paths = [&root, &alias, &other];
+        let probes = paths.map(|path| FileProbe::observe(path, true).unwrap());
+        let parsed = paths.map(|path| parsed_source(path));
+        fs::remove_file(&alias)?;
+        symlink(&other, &alias)?;
+
+        let mut output = Vec::new();
+        let mut session = Session::new(Config::default(), Some(&mut output));
+        session.enable_module_graph();
+        let files = paths.map(|path| FileName::Real(path.clone()));
+        session.record_module_graph(
+            &files[0],
+            files.iter(),
+            std::iter::empty(),
+            parsed.into_iter(),
+            Some(probes.into()),
+        );
+        let manifest = directory.path().join("modules.json");
+        session.write_module_manifest(&manifest, &[root])?;
+        let graph: serde_json::Value =
+            serde_json::from_slice(&fs::read(manifest)?).map_err(io::Error::other)?;
+        let deps = graph["roots"][0]["dependencies"].as_array().unwrap();
+        assert!(deps.contains(&serde_json::json!(original.canonicalize()?)));
+        Ok(())
+    }
+
     #[test]
     fn module_manifest_records_canonical_sorted_files_for_each_root() -> io::Result<()> {
         let directory = tempfile::tempdir()?;
@@ -1049,7 +1157,7 @@ mod unit_tests {
                 .map(|path| (path, modules::empty_module_topology())),
             [&second_root, &shared_module]
                 .into_iter()
-                .map(|path| Some(path.as_path())),
+                .map(|path| parsed_source(path)),
             Some(vec![
                 FileProbe::observe(&second_root, true).unwrap(),
                 FileProbe::observe(&shared_module, true).unwrap(),
@@ -1067,7 +1175,7 @@ mod unit_tests {
                 .map(|path| (path, modules::empty_module_topology())),
             [&first_root, &shared_module]
                 .into_iter()
-                .map(|path| Some(path.as_path())),
+                .map(|path| parsed_source(path)),
             Some(vec![
                 FileProbe::observe(&first_root, true).unwrap(),
                 FileProbe::observe(&shared_module, true).unwrap(),
@@ -1789,7 +1897,7 @@ mod unit_tests {
             &FileName::Real(root.clone()),
             [FileName::Real(module)].iter(),
             std::iter::empty(),
-            [root.as_path()].into_iter().map(Some),
+            [parsed_source(&root)].into_iter(),
             Some(vec![FileProbe::observe(&root, true).unwrap()]),
         );
 

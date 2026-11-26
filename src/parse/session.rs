@@ -263,28 +263,33 @@ fn default_dcx(
 }
 
 impl ParseSess {
-    pub(crate) fn new(config: &Config, record_file_probes: bool) -> Result<ParseSess, ErrorKind> {
+    pub(crate) fn new(
+        config: &Config,
+        recording: Option<SourceFileHashAlgorithm>,
+    ) -> Result<ParseSess, ErrorKind> {
         let ignore_path_set = match IgnorePathSet::from_ignore_list(&config.ignore()) {
             Ok(ignore_path_set) => Arc::new(ignore_path_set),
             Err(e) => return Err(ErrorKind::InvalidGlobPattern(e)),
         };
-        let file_probes = if record_file_probes {
+        let file_probes = if recording.is_some() {
             Some(Arc::new(RecordedFileProbes::new()?))
         } else {
             None
         };
-        let source_map = Arc::new(if let Some(probes) = &file_probes {
-            SourceMap::with_inputs(SourceMapInputs {
-                file_loader: Box::new(RecordingFileLoader {
-                    probes: Arc::clone(probes),
-                }),
-                path_mapping: FilePathMapping::empty(),
-                hash_kind: SourceFileHashAlgorithm::Md5,
-                checksum_hash_kind: None,
-            })
-        } else {
-            SourceMap::new(FilePathMapping::empty())
-        });
+        let source_map = Arc::new(
+            if let (Some(hash_kind), Some(probes)) = (recording, &file_probes) {
+                SourceMap::with_inputs(SourceMapInputs {
+                    file_loader: Box::new(RecordingFileLoader {
+                        probes: Arc::clone(probes),
+                    }),
+                    path_mapping: FilePathMapping::empty(),
+                    hash_kind,
+                    checksum_hash_kind: None,
+                })
+            } else {
+                SourceMap::new(FilePathMapping::empty())
+            },
+        );
         let can_reset_errors = Arc::new(AtomicBool::new(false));
         let emitted_diagnostics = Arc::new(AtomicBool::new(false));
 
@@ -438,7 +443,22 @@ impl ParseSess {
     /// Records reads of unnormalized source text used to compare line endings.
     pub(crate) fn read_source(&self, path: &Path) -> io::Result<String> {
         match &self.file_probes {
-            Some(probes) => probes.read_source(path),
+            Some(probes) => {
+                let content = probes.read_source(path)?;
+                let map = self.raw_psess.source_map();
+                let name = rustc_span::FileName::Real(
+                    map.path_mapping().to_real_filename(map.working_dir(), path),
+                );
+                // A replacement can preserve mtime and permissions. Never certify
+                // parser bytes if the emitter compared different original text.
+                if map.get_source_file(&name).is_none_or(|source| {
+                    source.src_hash.kind == SourceFileHashAlgorithm::Blake3
+                        && !source.src_hash.matches(&content)
+                }) {
+                    probes.complete.store(false, Ordering::Release);
+                }
+                Ok(content)
+            }
             None => fs::read_to_string(path),
         }
     }
@@ -514,6 +534,30 @@ mod tests {
     use super::*;
 
     use rustfmt_config_proc_macro::nightly_only_test;
+
+    #[test]
+    fn a_source_reread_must_match_the_parser_even_if_metadata_matches() -> std::io::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("source.rs");
+        fs::write(&path, "fn f( ){}\n")?;
+        let modified = fs::metadata(&path)?.modified()?;
+        let config = Config::default();
+        rustc_span::create_session_if_not_set_then(config.edition().into(), |_| {
+            let session = ParseSess::new(&config, Some(SourceFileHashAlgorithm::Blake3))
+                .map_err(io::Error::other)?;
+            session.inner().source_map().load_file(&path)?;
+            session.read_source(&path)?;
+            assert!(session.probes_complete());
+            fs::write(&path, "fn f() {}\n")?;
+            fs::File::options()
+                .write(true)
+                .open(&path)?
+                .set_modified(modified)?;
+            session.read_source(&path)?;
+            assert!(!session.probes_complete());
+            Ok(())
+        })
+    }
 
     #[test]
     fn source_probe_rejects_another_open_file_at_the_same_path() -> std::io::Result<()> {

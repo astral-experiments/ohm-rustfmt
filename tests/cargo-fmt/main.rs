@@ -298,6 +298,42 @@ fn fallback_formatter_can_lock_the_cache() -> std::io::Result<()> {
 }
 
 #[cfg(unix)]
+#[test]
+fn a_path_lookup_cannot_reuse_the_working_directory_formatter() -> std::io::Result<()> {
+    let directory = tempfile::tempdir()?;
+    let package = directory.path().canonicalize()?;
+    let (tools, libraries) = trusted_formatter_tools(&package)?;
+    fs::write(
+        package.join("Cargo.toml"),
+        "[package]\nname = 'lookup'\nversion = '0.1.0'\nedition = '2021'\n[lib]\npath = 'lib.rs'\n",
+    )?;
+    fs::write(package.join("lib.rs"), "pub fn clean() {}\n")?;
+
+    let mut command = Command::new(tools.join("cargo-fmt"));
+    command
+        .arg("--check")
+        .current_dir(&package)
+        .env("OHM_INCREMENTAL_FMT", "1")
+        .env("OHM_INCREMENTAL_FMT_CACHE_DIR", package.join("cache"))
+        .env("LD_LIBRARY_PATH", &libraries)
+        .env("DYLD_LIBRARY_PATH", &libraries)
+        .env_remove("DYLD_FALLBACK_LIBRARY_PATH")
+        .env_remove("RUSTFMT");
+    assert!(command.output()?.status.success());
+
+    // The alias resolves to the native sibling only when looked up from the
+    // project. It is deliberately absent from the child's PATH.
+    let name = "ohm-rustfmt-test-lookup";
+    std::os::unix::fs::symlink(tools.join("rustfmt"), package.join(name))?;
+    let path = env::var_os("PATH").unwrap_or_default();
+    let paths = env::split_paths(&path).filter(|p| p.is_absolute());
+    command.env("PATH", env::join_paths(paths).unwrap());
+    let output = command.env("RUSTFMT", name).output()?;
+    assert!(!output.status.success());
+    Ok(())
+}
+
+#[cfg(unix)]
 fn trusted_formatter_tools(
     package: &Path,
 ) -> std::io::Result<(std::path::PathBuf, std::path::PathBuf)> {
@@ -422,6 +458,55 @@ fn formatting_a_new_hard_link_preserves_edition_order() -> std::io::Result<()> {
         }
         assert_eq!(fs::read_to_string(&shared)?, expected);
     }
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn paired_source_and_manifest_edits_keep_edition_and_config_checks() -> std::io::Result<()> {
+    let directory = tempfile::tempdir()?;
+    let package = directory.path().canonicalize()?;
+    let (tools, libraries) = trusted_formatter_tools(&package)?;
+    let manifest = package.join("Cargo.toml");
+    let project = "[package]\nname = 'testcfg'\nversion = '0.1.0'\nedition.workspace = true\n\
+                   [workspace.package]\nedition = '2021'\n";
+    fs::write(&manifest, project)?;
+    let config = package.join("rustfmt.toml");
+    fs::write(&config, "hard_tabs = false\n")?;
+    let src = package.join("src");
+    fs::create_dir(&src)?;
+    fs::write(src.join("lib.rs"), "pub fn gen() -> u32 {\n    7\n}\n")?;
+    fs::write(src.join("main.rs"), "fn main() {}\n")?;
+    let check = |enabled: &str| {
+        Command::new(tools.join("cargo-fmt"))
+            .args(["--all", "--", "--check"])
+            .current_dir(&package)
+            .env("OHM_INCREMENTAL_FMT", enabled)
+            .env_remove("OHM_INCREMENTAL_FMT_TRACE")
+            .env("OHM_INCREMENTAL_FMT_CACHE_DIR", package.join("cache"))
+            .env("DYLD_LIBRARY_PATH", &libraries)
+            .env("LD_LIBRARY_PATH", &libraries)
+            .env_remove("DYLD_FALLBACK_LIBRARY_PATH")
+            .output()
+    };
+    let warm = check("1")?;
+    assert!(warm.status.success(), "{warm:?}");
+    fs::write(src.join("main.rs"), "// Edited.\nfn main() {}\n")?;
+
+    // Cargo must pass the new inherited edition to the untouched library.
+    fs::write(&manifest, project.replace("2021", "2024"))?;
+    let error = check("1")?;
+    assert!(!error.status.success());
+    assert!(String::from_utf8_lossy(&error.stderr).contains("gen"));
+    assert_eq!(error, check("0")?);
+
+    // Restore the edition but change both manifest bytes and formatter settings.
+    fs::write(&manifest, format!("{project}# Edited.\n"))?;
+    fs::write(&config, "hard_tabs = true\n")?;
+    let diff = check("1")?;
+    assert_eq!(diff.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&diff.stdout).contains("lib.rs"));
+    assert_eq!(diff, check("0")?);
     Ok(())
 }
 
@@ -772,4 +857,71 @@ fn cargo_fmt_batches_clean_leaves_without_hiding_multiple_formatting_errors() ->
     assert!(stdout.contains("first.rs"));
     assert!(stdout.contains("second.rs"));
     Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn a_removed_module_does_not_permanently_disable_caching() -> std::io::Result<()> {
+    let directory = tempfile::tempdir()?;
+    let package = directory.path().canonicalize()?;
+    let (tools, libraries) = trusted_formatter_tools(&package)?;
+    let manifest = package.join("Cargo.toml");
+    let project = "[package]\nname='recheck'\nversion='0.1.0'\nedition='2021'\n";
+    fs::write(&manifest, project)?;
+    let src = package.join("src");
+    fs::create_dir(&src)?;
+    fs::write(src.join("main.rs"), "fn main() {}\n")?;
+    fs::write(src.join("lib.rs"), "pub mod old;\n")?;
+    fs::write(src.join("old.rs"), "pub fn f() {}\n")?;
+    let check = || {
+        Command::new(tools.join("cargo-fmt"))
+            .arg("--check")
+            .current_dir(&package)
+            .env("OHM_INCREMENTAL_FMT", "1")
+            .env("OHM_INCREMENTAL_FMT_TRACE", "1")
+            .env("OHM_INCREMENTAL_FMT_CACHE_DIR", package.join("cache"))
+            .env("DYLD_LIBRARY_PATH", &libraries)
+            .env("LD_LIBRARY_PATH", &libraries)
+            .env_remove("DYLD_FALLBACK_LIBRARY_PATH")
+            .output()
+    };
+    assert!(check()?.status.success());
+    fs::write(&manifest, format!("{project}# Edited.\n"))?;
+    fs::write(src.join("lib.rs"), "pub fn g() {}\n")?;
+    assert!(check()?.status.success());
+    assert!(check()?.status.success());
+    let repeat = check()?;
+    assert!(repeat.status.success());
+    assert!(
+        String::from_utf8_lossy(&repeat.stderr).contains("cache hit"),
+        "{repeat:?}"
+    );
+    fs::write(src.join("old.rs"), "pub fn f( ){}\n")?;
+    fs::write(src.join("lib.rs"), "pub mod old;\n")?;
+    assert_eq!(check()?.status.code(), Some(1));
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn a_signaled_formatter_is_not_a_successful_check() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(
+        dir.path().join("Cargo.toml"),
+        "[package]\nname = \"signal\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .unwrap();
+    fs::create_dir(dir.path().join("src")).unwrap();
+    // With sh as the formatter, the first target path is its script argument.
+    let script = dir.path().join("src/lib.rs");
+    for (body, expected) in [("exit 0", 0), ("exit 7", 7), ("kill -TERM $$", 1)] {
+        fs::write(&script, body).unwrap();
+        let output = cargo_fmt_command()
+            .current_dir(dir.path())
+            .env("RUSTFMT", "/bin/sh")
+            .args(["fmt", "--check"])
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(expected), "{output:?}");
+    }
 }
