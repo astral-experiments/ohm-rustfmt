@@ -19,16 +19,16 @@ use super::{
     run_rustfmt_with_output, rustfmt_command,
 };
 
-const CACHE_VERSION: u32 = 19;
-const MODULE_MANIFEST_VERSION: u32 = 6;
+const CACHE_VERSION: u32 = 23;
+const MODULE_MANIFEST_VERSION: u32 = 8;
 const MODULE_MANIFEST_SCHEMA: &str = "ohm.rustfmt-files";
 const MODULE_MANIFEST_ENVIRONMENT: &str = "OHM_RUSTFMT_MODULE_MANIFEST";
 const CHANGED_MODULE_ENVIRONMENT: &str = "OHM_RUSTFMT_CHANGED_MODULE";
 const MODULE_TOPOLOGY_ENVIRONMENT: &str = "OHM_RUSTFMT_MODULE_TOPOLOGY";
 const MODULE_WRITE_ENVIRONMENT: &str = "OHM_RUSTFMT_ALLOW_MODULE_WRITE";
 const LEAF_CERTIFICATE_SCHEMA: &str = "ohm.rustfmt-leaf";
-const LEAF_CERTIFICATE_VERSION: u32 = 11;
-const LEAF_WRITE_CERTIFICATE_VERSION: u32 = 12;
+const LEAF_CERTIFICATE_VERSION: u32 = 13;
+const LEAF_WRITE_CERTIFICATE_VERSION: u32 = 14;
 const ENABLE_ENVIRONMENT: &str = "OHM_INCREMENTAL_FMT";
 const CACHE_ENVIRONMENT: &str = "OHM_INCREMENTAL_FMT_CACHE_DIR";
 const TRACE_ENVIRONMENT: &str = "OHM_INCREMENTAL_FMT_TRACE";
@@ -61,10 +61,27 @@ struct PackageSnapshot {
 /// Captures existence, symlink destination, and directory-sensitive module resolution.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct ProbeObservation {
-    canonical: Option<String>,
-    exists: bool,
-    is_directory: bool,
+enum ProbeObservation {
+    Missing,
+    File,
+    Directory,
+    FileAlias(String),
+    DirectoryAlias(String),
+}
+
+impl ProbeObservation {
+    /// The map key already stores an exact destination for a canonical probe.
+    fn canonical<'a>(&'a self, key: &'a str) -> Option<&'a str> {
+        match self {
+            Self::Missing => None,
+            Self::File | Self::Directory => Some(key),
+            Self::FileAlias(path) | Self::DirectoryAlias(path) => Some(path),
+        }
+    }
+
+    fn is_directory(&self) -> bool {
+        matches!(self, Self::Directory | Self::DirectoryAlias(_))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1316,11 +1333,7 @@ impl Snapshot {
                         let (_, metadata) = canonical_module_file(path)?;
                         observed_probes
                             .entry(path)
-                            .or_insert_with(|| ProbeObservation {
-                                canonical: Some(path.to_owned()),
-                                exists: true,
-                                is_directory: false,
-                            });
+                            .or_insert(ProbeObservation::File);
                         *entry.insert(SourceFingerprint::from_metadata(&metadata)?)
                     }
                 };
@@ -1611,24 +1624,22 @@ fn read_module_manifests(paths: &[PathBuf], targets: &BTreeSet<Target>) -> io::R
             let mut observations = BTreeMap::new();
             let mut observed_dependencies = BTreeMap::new();
             for probe in root.probes {
-                let expected = ProbeObservation {
-                    canonical: probe.canonical,
-                    exists: probe.exists,
-                    is_directory: probe.is_directory,
-                };
-                if expected.exists != expected.canonical.is_some()
-                    || (!expected.exists && expected.is_directory)
+                if probe.exists != probe.canonical.is_some()
+                    || (!probe.exists && probe.is_directory)
                 {
                     return Err(unsupported(
                         "an authoritative source probe has inconsistent existence",
                     ));
                 }
-                if observe_module_probe(&probe.path)? != expected {
+                let observed = observe_module_probe(&probe.path)?;
+                if observed.canonical(&probe.path) != probe.canonical.as_deref()
+                    || observed.is_directory() != probe.is_directory
+                {
                     return Err(unsupported(
                         "an authoritative source probe changed during formatting",
                     ));
                 }
-                if let Some(canonical) = expected
+                if let Some(canonical) = probe
                     .canonical
                     .as_ref()
                     .filter(|path| dependencies.contains(*path))
@@ -1643,7 +1654,7 @@ fn read_module_manifests(paths: &[PathBuf], targets: &BTreeSet<Target>) -> io::R
                         return Err(unsupported("a source changed between parser probes"));
                     }
                 }
-                if observations.insert(probe.path, expected).is_some() {
+                if observations.insert(probe.path, observed).is_some() {
                     return Err(unsupported(
                         "the authoritative module manifest repeats a resolution probe",
                     ));
@@ -1713,25 +1724,22 @@ fn canonical_module_file(path: &str) -> io::Result<(PathBuf, fs::Metadata)> {
 }
 
 /// Replays native module lookup, preserving missing candidates, symlinks, and file kind.
-fn observe_module_probe(path: &str) -> io::Result<ProbeObservation> {
-    let path = Path::new(path);
+fn observe_module_probe(key: &str) -> io::Result<ProbeObservation> {
+    let path = Path::new(key);
     if !path.is_absolute() {
         return Err(unsupported("an authoritative source probe is not absolute"));
     }
-    // `Path::exists` is exactly `fs::metadata(path).is_ok()`. Retaining the
-    // metadata also records directory decisions without a second stat call.
-    let metadata = fs::metadata(path);
-    let exists = metadata.is_ok();
-    let is_directory = metadata.as_ref().is_ok_and(fs::Metadata::is_dir);
-    let canonical = if exists {
-        Some(path_string(&canonicalize(path)?)?)
-    } else {
-        None
+    // Path::exists is exactly fs::metadata(path).is_ok().
+    let Ok(metadata) = fs::metadata(path) else {
+        return Ok(ProbeObservation::Missing);
     };
-    Ok(ProbeObservation {
-        canonical,
-        exists,
-        is_directory,
+    let canonical = canonicalize(path)?;
+    // Compare the spelling, not Path equality (which normalizes components).
+    Ok(match (canonical.to_str() == Some(key), metadata.is_dir()) {
+        (true, false) => ProbeObservation::File,
+        (true, true) => ProbeObservation::Directory,
+        (false, false) => ProbeObservation::FileAlias(path_string(&canonical)?),
+        (false, true) => ProbeObservation::DirectoryAlias(path_string(&canonical)?),
     })
 }
 
@@ -2411,6 +2419,8 @@ mod tests {
             }),
             modified_nanoseconds: 0,
             permissions_mode: 0o644,
+            file_id: (0, 0),
+            changed: None,
         }
     }
 
@@ -2599,10 +2609,10 @@ mod tests {
                 .ok()
                 .map(|m| SourceFingerprint::from_metadata(&m))
                 .transpose()?,
+            canonical: observation.canonical(&path).map(str::to_owned),
+            exists: observation != ProbeObservation::Missing,
+            is_directory: observation.is_directory(),
             path,
-            canonical: observation.canonical,
-            exists: observation.exists,
-            is_directory: observation.is_directory,
         })
     }
 
@@ -2678,8 +2688,29 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(unix)]
     #[test]
-    fn restored_timestamps_share_ruffs_documented_metadata_trust_boundary() -> io::Result<()> {
+    fn different_files_with_equal_timestamps_keep_distinct_cache_identities() -> io::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let identify = |name, code: &str| -> io::Result<_> {
+            let path = directory.path().join(name);
+            fs::write(&path, code)?;
+            let mut source = SourceFingerprint::from_metadata(&fs::metadata(&path)?)?;
+            // Simulate extraction with the same mtime in one filesystem clock tick.
+            source.modified_seconds = 0;
+            source.modified_nanoseconds = 0;
+            source.changed = None;
+            let stored = serde_json::to_vec(&source)?;
+            let restored = serde_json::from_slice::<SourceFingerprint>(&stored)?;
+            assert_eq!(source, restored);
+            Ok(restored)
+        };
+        assert_ne!(identify("a", "fn x() {}")?, identify("b", "fn x( ){}")?);
+        Ok(())
+    }
+
+    #[test]
+    fn restoring_mtime_preserves_any_change_time_difference() -> io::Result<()> {
         let directory = tempfile::tempdir()?;
         let path = directory.path().join("source.rs");
         let timestamp = UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
@@ -2688,16 +2719,32 @@ mod tests {
             .write(true)
             .open(&path)?
             .set_times(fs::FileTimes::new().set_modified(timestamp))?;
-        let before = SourceFingerprint::from_metadata(&fs::metadata(&path)?)?;
+        let before_meta = fs::metadata(&path)?;
+        let before = SourceFingerprint::from_metadata(&before_meta)?;
 
-        fs::write(&path, "pub fn deliberately_restored() {}\n")?;
+        fs::write(&path, "pub fn other() {}\n")?;
         OpenOptions::new()
             .write(true)
             .open(&path)?
             .set_times(fs::FileTimes::new().set_modified(timestamp))?;
-        let after = SourceFingerprint::from_metadata(&fs::metadata(&path)?)?;
+        let after_meta = fs::metadata(&path)?;
+        let after = SourceFingerprint::from_metadata(&after_meta)?;
 
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            assert_eq!(
+                before == after,
+                (before_meta.ctime(), before_meta.ctime_nsec())
+                    == (after_meta.ctime(), after_meta.ctime_nsec())
+            );
+        }
+        #[cfg(not(unix))]
         assert_eq!(before, after);
+        for value in [before, after] {
+            let encoded = serde_json::to_vec(&value)?;
+            assert_eq!(value, serde_json::from_slice(&encoded)?);
+        }
         Ok(())
     }
 
@@ -2884,14 +2931,7 @@ mod tests {
                         .probes
                         .get_mut(root)
                         .unwrap()
-                        .insert(
-                            "/new/module.rs".to_owned(),
-                            ProbeObservation {
-                                canonical: None,
-                                exists: false,
-                                is_directory: false,
-                            },
-                        );
+                        .insert("/new/module.rs".to_owned(), ProbeObservation::Missing);
                 }
                 "topology" => {
                     concurrent
@@ -3136,11 +3176,7 @@ mod tests {
             if let Some(probes) = package.probes.get_mut("/workspace/first/src/lib.rs") {
                 probes.insert(
                     String::from("/workspace/first/src/nested/mod.rs"),
-                    ProbeObservation {
-                        canonical: None,
-                        exists: false,
-                        is_directory: false,
-                    },
+                    ProbeObservation::Missing,
                 );
             }
         }
@@ -3149,11 +3185,7 @@ mod tests {
             if let Some(probes) = package.probes.get_mut("/workspace/first/src/lib.rs") {
                 probes.insert(
                     String::from("/workspace/first/src/nested/mod.rs"),
-                    ProbeObservation {
-                        canonical: Some(String::from("/workspace/first/src/nested/mod.rs")),
-                        exists: true,
-                        is_directory: false,
-                    },
+                    ProbeObservation::File,
                 );
             }
         }
@@ -3172,11 +3204,7 @@ mod tests {
             if let Some(probes) = package.probes.get_mut("/workspace/first/src/lib.rs") {
                 probes.insert(
                     String::from("/workspace/first/src/linked.rs"),
-                    ProbeObservation {
-                        canonical: Some(String::from("/workspace/shared/old.rs")),
-                        exists: true,
-                        is_directory: false,
-                    },
+                    ProbeObservation::FileAlias(String::from("/workspace/shared/old.rs")),
                 );
             }
         }
@@ -3185,11 +3213,7 @@ mod tests {
             if let Some(probes) = package.probes.get_mut("/workspace/first/src/lib.rs") {
                 probes.insert(
                     String::from("/workspace/first/src/linked.rs"),
-                    ProbeObservation {
-                        canonical: Some(String::from("/workspace/shared/new.rs")),
-                        exists: true,
-                        is_directory: false,
-                    },
+                    ProbeObservation::FileAlias(String::from("/workspace/shared/new.rs")),
                 );
             }
         }
@@ -3208,26 +3232,12 @@ mod tests {
         let logical = String::from("/workspace/first/src/nested/mod.rs");
         let expected = ProbeGraph::from([(
             root.clone(),
-            BTreeMap::from([(
-                logical.clone(),
-                ProbeObservation {
-                    canonical: None,
-                    exists: false,
-                    is_directory: false,
-                },
-            )]),
+            BTreeMap::from([(logical.clone(), ProbeObservation::Missing)]),
         )]);
         if let Some(package) = snapshot.packages.get_mut("/workspace/first") {
             package.probes.insert(
                 root,
-                BTreeMap::from([(
-                    logical.clone(),
-                    ProbeObservation {
-                        canonical: Some(logical),
-                        exists: true,
-                        is_directory: false,
-                    },
-                )]),
+                BTreeMap::from([(logical.clone(), ProbeObservation::File)]),
             );
         }
 
@@ -3275,11 +3285,7 @@ mod tests {
 
         discovery.probes.get_mut(root).unwrap().insert(
             String::from("/workspace/first/src/replacement.rs"),
-            ProbeObservation {
-                canonical: None,
-                exists: false,
-                is_directory: false,
-            },
+            ProbeObservation::Missing,
         );
         assert!(!discovery_matches(&discovery, &checked));
     }
@@ -4431,7 +4437,8 @@ mod tests {
             snapshot.packages[&package_path].targets[&root_path][&module_path],
         );
         assert!(
-            refreshed.packages[&package_path].probes[&root_path][&path_string(&missing)?].exists
+            refreshed.packages[&package_path].probes[&root_path][&path_string(&missing)?]
+                != ProbeObservation::Missing
         );
         for captured in [&snapshot, &refreshed] {
             let package = &captured.packages[&package_path];
@@ -4444,6 +4451,28 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn noncanonical_spelling_survives_probe_round_trip() -> io::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().canonicalize()?;
+        fs::write(path.join("leaf.rs"), "")?;
+        for suffix in ["/.", "/./leaf.rs", "/leaf.rs", "", "/missing"] {
+            let key = format!("{}{suffix}", path_string(&path)?);
+            let observed = observe_module_probe(&key)?;
+            let json = serde_json::to_vec(&observed)?;
+            let stored: ProbeObservation = serde_json::from_slice(&json)?;
+            let destination = Path::new(&key).canonicalize().ok();
+            assert_eq!(
+                stored.canonical(&key),
+                destination.as_ref().and_then(|p| p.to_str())
+            );
+            assert_eq!(stored.is_directory(), Path::new(&key).is_dir());
+            assert_eq!(observed, stored);
+        }
+        Ok(())
+    }
+
     #[test]
     fn resolution_probes_track_existing_and_missing_directories() -> io::Result<()> {
         let directory = tempfile::tempdir()?;
@@ -4452,19 +4481,11 @@ mod tests {
 
         assert_eq!(
             observe_module_probe(&path_string(&existing)?)?,
-            ProbeObservation {
-                canonical: Some(path_string(&existing)?),
-                exists: true,
-                is_directory: true,
-            }
+            ProbeObservation::Directory
         );
         assert_eq!(
             observe_module_probe(&path_string(&missing)?)?,
-            ProbeObservation {
-                canonical: None,
-                exists: false,
-                is_directory: false,
-            }
+            ProbeObservation::Missing
         );
         Ok(())
     }
@@ -4487,8 +4508,11 @@ mod tests {
         let second = observe_module_probe(&path_string(&logical)?)?;
 
         assert_ne!(first, second);
-        assert_eq!(first.canonical, Some(path_string(&original)?));
-        assert_eq!(second.canonical, Some(path_string(&replacement)?));
+        assert_eq!(first, ProbeObservation::FileAlias(path_string(&original)?));
+        assert_eq!(
+            second,
+            ProbeObservation::FileAlias(path_string(&replacement)?)
+        );
         Ok(())
     }
 
@@ -4503,9 +4527,8 @@ mod tests {
         fs::write(&candidate, "pub fn nested() {}")?;
         let second = observe_module_probe(&path_string(&candidate)?)?;
 
-        assert!(!first.exists);
-        assert!(second.exists);
-        assert_ne!(first, second);
+        assert_eq!(first, ProbeObservation::Missing);
+        assert_eq!(second, ProbeObservation::File);
         Ok(())
     }
 
@@ -4521,12 +4544,8 @@ mod tests {
         fs::create_dir(&candidate)?;
         let second = observe_module_probe(&path_string(&candidate)?)?;
 
-        assert!(first.exists);
-        assert!(second.exists);
-        assert_eq!(first.canonical, second.canonical);
-        assert!(!first.is_directory);
-        assert!(second.is_directory);
-        assert_ne!(first, second);
+        assert_eq!(first, ProbeObservation::File);
+        assert_eq!(second, ProbeObservation::Directory);
         Ok(())
     }
 
