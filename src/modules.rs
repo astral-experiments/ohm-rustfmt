@@ -1,6 +1,7 @@
 use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 
 use rustc_ast::ast;
 use rustc_ast::visit::Visitor;
@@ -23,11 +24,19 @@ mod visitor;
 
 type FileModMap<'ast> = BTreeMap<FileName, Module<'ast>>;
 
+// External modules are both retained in the file map and visited recursively.
+// Share their immutable items so cloning a module doesn't copy its entire AST.
+#[derive(Debug, Clone)]
+enum ModuleItems<'a> {
+    Borrowed(&'a [Box<ast::Item>]),
+    Shared(Rc<ThinVec<Box<ast::Item>>>),
+}
+
 /// Represents module with its inner attributes.
 #[derive(Debug, Clone)]
 pub(crate) struct Module<'a> {
     ast_mod_kind: Option<Cow<'a, ast::ModKind>>,
-    pub(crate) items: Cow<'a, ThinVec<Box<ast::Item>>>,
+    items: ModuleItems<'a>,
     inner_attr: ast::AttrVec,
     pub(crate) span: Span,
 }
@@ -45,10 +54,20 @@ impl<'a> Module<'a> {
             .cloned()
             .collect();
         Module {
-            items: mod_items,
+            items: match mod_items {
+                Cow::Borrowed(items) => ModuleItems::Borrowed(items),
+                Cow::Owned(items) => ModuleItems::Shared(Rc::new(items)),
+            },
             inner_attr,
             span: mod_span,
             ast_mod_kind,
+        }
+    }
+
+    pub(crate) fn items(&self) -> &[Box<ast::Item>] {
+        match &self.items {
+            ModuleItems::Borrowed(items) => items,
+            ModuleItems::Shared(items) => items,
         }
     }
 
@@ -100,7 +119,7 @@ pub(crate) fn module_topology(module: &Module<'_>) -> Option<String> {
         supported: true,
     };
     visitor.digest.update(b"ohm.rustfmt.module-topology.v1\0");
-    for item in module.items.iter() {
+    for item in module.items() {
         visitor.visit_item(item);
         if !visitor.supported {
             return None;
@@ -210,9 +229,9 @@ impl<'ast, 'psess, 'c> ModResolver<'ast, 'psess> {
     }
 
     /// Visit `cfg_if` macro and look for module declarations.
-    fn visit_cfg_if(&mut self, item: Cow<'ast, ast::Item>) -> Result<(), ModuleResolutionError> {
+    fn visit_cfg_if(&mut self, item: &ast::Item) -> Result<(), ModuleResolutionError> {
         let mut visitor = visitor::CfgIfVisitor::new(self.psess);
-        visitor.visit_item(&item);
+        visitor.visit_item(item);
         for module_item in visitor.mods() {
             if let ast::ItemKind::Mod(_, _, ref sub_mod_kind) = module_item.item.kind {
                 self.visit_sub_mod(
@@ -229,12 +248,9 @@ impl<'ast, 'psess, 'c> ModResolver<'ast, 'psess> {
         Ok(())
     }
 
-    fn visit_cfg_select(
-        &mut self,
-        item: Cow<'ast, ast::Item>,
-    ) -> Result<(), ModuleResolutionError> {
+    fn visit_cfg_select(&mut self, item: &ast::Item) -> Result<(), ModuleResolutionError> {
         let mut visitor = visitor::CfgSelectVisitor::new(self.psess);
-        visitor.visit_item(&item);
+        visitor.visit_item(item);
         for module_item in visitor.mods() {
             if let ast::ItemKind::Mod(_, _, ref sub_mod_kind) = module_item.item.kind {
                 self.visit_sub_mod(
@@ -254,23 +270,23 @@ impl<'ast, 'psess, 'c> ModResolver<'ast, 'psess> {
     /// Visit modules defined inside macro calls.
     fn visit_mod_outside_ast(
         &mut self,
-        items: ThinVec<Box<ast::Item>>,
+        items: &[Box<ast::Item>],
     ) -> Result<(), ModuleResolutionError> {
         for item in items {
-            if is_cfg_if(&item) {
-                self.visit_cfg_if(Cow::Owned(*item))?;
+            if is_cfg_if(item) {
+                self.visit_cfg_if(item)?;
                 continue;
             }
 
-            if is_cfg_select(&item) {
-                self.visit_cfg_select(Cow::Owned(*item))?;
+            if is_cfg_select(item) {
+                self.visit_cfg_select(item)?;
                 continue;
             }
 
             if let ast::ItemKind::Mod(_, _, ref sub_mod_kind) = item.kind {
                 let span = item.span;
                 self.visit_sub_mod(
-                    &item,
+                    item,
                     Module::new(
                         span,
                         Some(Cow::Owned(sub_mod_kind.clone())),
@@ -290,11 +306,11 @@ impl<'ast, 'psess, 'c> ModResolver<'ast, 'psess> {
     ) -> Result<(), ModuleResolutionError> {
         for item in items {
             if is_cfg_if(item) {
-                self.visit_cfg_if(Cow::Borrowed(item))?;
+                self.visit_cfg_if(item)?;
             }
 
             if is_cfg_select(item) {
-                self.visit_cfg_select(Cow::Borrowed(item))?;
+                self.visit_cfg_select(item)?;
             }
 
             if let ast::ItemKind::Mod(_, _, ref sub_mod_kind) = item.kind {
@@ -412,9 +428,10 @@ impl<'ast, 'psess, 'c> ModResolver<'ast, 'psess> {
             (Some(Cow::Borrowed(ast::ModKind::Loaded(items, _, _))), _) => {
                 self.visit_mod_from_ast(items)
             }
-            (Some(Cow::Owned(ast::ModKind::Loaded(items, _, _))), _) | (_, Cow::Owned(items)) => {
-                self.visit_mod_outside_ast(items)
+            (Some(Cow::Owned(ast::ModKind::Loaded(items, _, _))), _) => {
+                self.visit_mod_outside_ast(&items)
             }
+            (_, ModuleItems::Shared(items)) => self.visit_mod_outside_ast(&items),
             (_, _) => Ok(()),
         }
     }
@@ -694,4 +711,22 @@ fn is_cfg_select(item: &ast::Item) -> bool {
         }
         _ => false,
     }
+}
+
+#[test]
+fn external_module_clones_share_parsed_items() {
+    let config = crate::Config::default();
+    rustc_span::create_session_if_not_set_then(config.edition().into(), |_| {
+        let psess =
+            ParseSess::new(&config, Some(rustc_span::SourceFileHashAlgorithm::Blake3)).unwrap();
+        let (attrs, items, span) = Parser::parse_file_as_module(
+            &psess,
+            Path::new("tests/mod-resolver/issue-5063/foo.rs"),
+            rustc_span::DUMMY_SP,
+        )
+        .unwrap();
+        let module = Module::new(span, None, Cow::Owned(items), Cow::Owned(attrs));
+        assert!(!module.items().is_empty());
+        assert!(std::ptr::eq(module.items(), module.clone().items()));
+    });
 }

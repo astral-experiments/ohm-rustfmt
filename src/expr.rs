@@ -443,6 +443,11 @@ pub(crate) fn format_expr(
     expr_rw
         .map(|expr_str| recover_comment_removed(expr_str, expr.span, context))
         .and_then(|expr_str| {
+            // Comment recovery above still applies. Without attributes, the
+            // prefix and the span before the expression are both empty.
+            if expr.attrs.is_empty() {
+                return Ok(expr_str);
+            }
             let attrs = outer_attributes(&expr.attrs);
             let attrs_str = attrs.rewrite_result(context, shape)?;
             let span = mk_sp(
@@ -578,7 +583,7 @@ pub(crate) fn rewrite_block_with_visitor(
         return Ok(rw_str);
     }
 
-    let mut visitor = FmtVisitor::from_context(context);
+    let mut visitor = FmtVisitor::from_context(context, block.span);
     visitor.block_indent = shape.indent;
     visitor.is_if_else_block = context.is_if_else_block();
     visitor.is_loop_block = context.is_loop_block();

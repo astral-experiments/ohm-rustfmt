@@ -616,6 +616,7 @@ fn stdin_formatting_smoke_test() {
         let mut session = Session::new(config, Some(&mut buf));
         session.format(input).unwrap();
         assert!(session.has_no_errors());
+        assert!(session.source_file.is_empty());
     }
 
     #[cfg(not(windows))]

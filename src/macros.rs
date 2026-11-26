@@ -78,7 +78,7 @@ impl Rewrite for ast::Item {
     }
 
     fn rewrite_result(&self, context: &RewriteContext<'_>, shape: Shape) -> RewriteResult {
-        let mut visitor = crate::visitor::FmtVisitor::from_context(context);
+        let mut visitor = crate::visitor::FmtVisitor::from_context(context, self.span());
         visitor.block_indent = shape.indent;
         visitor.last_pos = self.span().lo();
         visitor.visit_item(self);
@@ -1534,7 +1534,7 @@ fn rewrite_macro_with_items(
         _ => "",
     };
 
-    let mut visitor = FmtVisitor::from_context(context);
+    let mut visitor = FmtVisitor::from_context(context, span);
     visitor.block_indent = shape.indent.block_indent(context.config);
 
     // The current opener may be different from the original opener. This can happen

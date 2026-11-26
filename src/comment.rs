@@ -2,7 +2,7 @@
 
 use std::{borrow::Cow, iter};
 
-use itertools::{Itertools as _, MultiPeek, multipeek};
+use itertools::Itertools as _;
 use memchr::memchr;
 use rustc_span::Span;
 use tracing::{debug, trace};
@@ -1225,7 +1225,7 @@ where
     T: Iterator,
     T::Item: RichChar,
 {
-    base: MultiPeek<T>,
+    base: T,
     status: CharClassesStatus,
 }
 
@@ -1357,7 +1357,7 @@ where
 {
     pub(crate) fn new(base: T) -> CharClasses<T> {
         CharClasses {
-            base: multipeek(base),
+            base,
             status: CharClassesStatus::Normal,
         }
     }
@@ -1366,38 +1366,13 @@ where
 /// Returns `true` if the `r` just consumed opens a raw string literal, i.e. the run of
 /// `#`s that follows it ends in a `"`. Peeking a single `#` is not enough to tell a raw
 /// string apart from a raw identifier such as `r#struct`.
-fn is_raw_string_prefix<T>(iter: &mut MultiPeek<T>) -> bool
-where
-    T: Iterator,
-    T::Item: RichChar,
-{
-    while let Some(c) = iter.peek() {
-        match c.get_char() {
-            '#' => continue,
-            '"' => return true,
-            _ => return false,
-        }
-    }
-    false
-}
-
-fn is_raw_string_suffix<T>(iter: &mut MultiPeek<T>, count: u32) -> bool
-where
-    T: Iterator,
-    T::Item: RichChar,
-{
-    for _ in 0..count {
-        match iter.peek() {
-            Some(c) if c.get_char() == '#' => continue,
-            _ => return false,
-        }
-    }
-    true
+fn is_raw_string_prefix(mut chars: impl Iterator<Item = char>) -> bool {
+    chars.find(|&c| c != '#') == Some('"')
 }
 
 impl<T> Iterator for CharClasses<T>
 where
-    T: Iterator,
+    T: Iterator + Clone,
     T::Item: RichChar,
 {
     type Item = (FullCodeCharKind, T::Item);
@@ -1405,6 +1380,9 @@ where
     fn next(&mut self) -> Option<(FullCodeCharKind, T::Item)> {
         let item = self.base.next()?;
         let chr = item.get_char();
+        // Chars and CharIndices are cheap to clone. Advance a second cursor
+        // for lookahead without buffering items or moving the original.
+        let mut ahead = self.base.clone().map(|c| c.get_char());
         let mut char_kind = FullCodeCharKind::Normal;
         self.status = match self.status {
             CharClassesStatus::LitRawString(sharps) => {
@@ -1414,7 +1392,7 @@ where
                         if sharps == 0 {
                             char_kind = FullCodeCharKind::Normal;
                             CharClassesStatus::Normal
-                        } else if is_raw_string_suffix(&mut self.base, sharps) {
+                        } else if (0..sharps).all(|_| ahead.next() == Some('#')) {
                             CharClassesStatus::RawStringSuffix(sharps)
                         } else {
                             CharClassesStatus::LitRawString(sharps)
@@ -1463,44 +1441,27 @@ where
             },
             CharClassesStatus::LitCharEscape => CharClassesStatus::LitChar,
             CharClassesStatus::Normal => match chr {
-                'r' => match self.base.peek().map(RichChar::get_char) {
-                    Some('"') => {
-                        char_kind = FullCodeCharKind::InString;
-                        CharClassesStatus::RawStringPrefix(0)
-                    }
-                    // `r#` opens a raw string only if the `#`s end in a `"`; otherwise
-                    // this is a raw identifier like `r#struct` and stays normal code.
-                    Some('#') if is_raw_string_prefix(&mut self.base) => {
-                        char_kind = FullCodeCharKind::InString;
-                        CharClassesStatus::RawStringPrefix(0)
-                    }
-                    _ => CharClassesStatus::Normal,
-                },
+                'r' if is_raw_string_prefix(ahead.by_ref()) => {
+                    char_kind = FullCodeCharKind::InString;
+                    CharClassesStatus::RawStringPrefix(0)
+                }
                 '"' => {
                     char_kind = FullCodeCharKind::InString;
                     CharClassesStatus::LitString
                 }
                 '\'' => {
-                    // HACK: Work around mut borrow.
-                    match self.base.peek() {
-                        Some(next) if next.get_char() == '\\' => {
-                            self.status = CharClassesStatus::LitChar;
-                            return Some((char_kind, item));
-                        }
-                        _ => (),
-                    }
-
-                    match self.base.peek() {
-                        Some(next) if next.get_char() == '\'' => CharClassesStatus::LitChar,
-                        _ => CharClassesStatus::Normal,
+                    if ahead.next() == Some('\\') || ahead.next() == Some('\'') {
+                        CharClassesStatus::LitChar
+                    } else {
+                        CharClassesStatus::Normal
                     }
                 }
-                '/' => match self.base.peek() {
-                    Some(next) if next.get_char() == '*' => {
+                '/' => match ahead.next() {
+                    Some('*') => {
                         self.status = CharClassesStatus::BlockCommentOpening(1);
                         return Some((FullCodeCharKind::StartComment, item));
                     }
-                    Some(next) if next.get_char() == '/' => {
+                    Some('/') => {
                         self.status = CharClassesStatus::LineComment;
                         return Some((FullCodeCharKind::StartComment, item));
                     }
@@ -1512,7 +1473,7 @@ where
                 char_kind = FullCodeCharKind::InStringCommented;
                 if chr == '"' {
                     CharClassesStatus::BlockComment(deepness)
-                } else if chr == '*' && self.base.peek().map(RichChar::get_char) == Some('/') {
+                } else if chr == '*' && ahead.next() == Some('/') {
                     char_kind = FullCodeCharKind::InComment;
                     CharClassesStatus::BlockCommentClosing(deepness - 1)
                 } else {
@@ -1522,14 +1483,14 @@ where
             CharClassesStatus::BlockComment(deepness) => {
                 assert_ne!(deepness, 0);
                 char_kind = FullCodeCharKind::InComment;
-                match self.base.peek() {
-                    Some(next) if next.get_char() == '/' && chr == '*' => {
+                match chr {
+                    '*' if ahead.next() == Some('/') => {
                         CharClassesStatus::BlockCommentClosing(deepness - 1)
                     }
-                    Some(next) if next.get_char() == '*' && chr == '/' => {
+                    '/' if ahead.next() == Some('*') => {
                         CharClassesStatus::BlockCommentOpening(deepness + 1)
                     }
-                    _ if chr == '"' => CharClassesStatus::StringInBlockComment(deepness),
+                    '"' => CharClassesStatus::StringInBlockComment(deepness),
                     _ => self.status,
                 }
             }
@@ -1911,6 +1872,27 @@ fn remove_comment_header(comment: &str) -> &str {
 #[cfg(test)]
 mod test {
     use super::*;
+
+    #[test]
+    fn lookahead_preserves_literals_and_comment_offsets() {
+        let text = r###"'界' '\'' 'life r#type r##"//"#/*"## /* nested /* λ */ */ //"###;
+        let chars = CharClasses::new(text.chars()).collect::<Vec<_>>();
+        let mut starts = Vec::new();
+        let mut indexed = CharClasses::new(text.char_indices());
+        for ((offset, ch), (kind, actual)) in text.char_indices().zip(&chars) {
+            assert_eq!(*actual, ch);
+            assert_eq!(indexed.next(), Some((*kind, (offset, ch))));
+            if *kind == FullCodeCharKind::StartComment {
+                starts.push(offset);
+            }
+        }
+        assert_eq!(chars.len(), text.chars().count());
+        assert!(indexed.next().is_none());
+        assert_eq!(
+            starts,
+            [text.find("/* nested").unwrap(), text.rfind("//").unwrap()]
+        );
+    }
 
     #[test]
     fn char_classes() {

@@ -898,7 +898,7 @@ pub(crate) fn format_impl(
     let open_pos = snippet.find_uncommented("{").unknown_error()? + 1;
 
     if !items.is_empty() || contains_comment(&snippet[open_pos..]) {
-        let mut visitor = FmtVisitor::from_context(context);
+        let mut visitor = FmtVisitor::from_context(context, item.span);
         let item_indent = offset.block_only().block_indent(context.config);
         visitor.block_indent = item_indent;
         visitor.last_pos = lo + BytePos(open_pos as u32);
@@ -1310,7 +1310,7 @@ pub(crate) fn format_trait(
     let outer_indent_str = offset.block_only().to_string_with_newline(context.config);
 
     if !items.is_empty() || contains_comment(&snippet[open_pos..]) {
-        let mut visitor = FmtVisitor::from_context(context);
+        let mut visitor = FmtVisitor::from_context(context, block_span);
         visitor.block_indent = offset.block_only().block_indent(context.config);
         visitor.last_pos = block_span.lo() + BytePos(open_pos as u32);
 
@@ -3482,7 +3482,7 @@ impl Rewrite for ast::ForeignItem {
                     ..
                 } = **fn_kind;
                 if body.is_some() {
-                    let mut visitor = FmtVisitor::from_context(context);
+                    let mut visitor = FmtVisitor::from_context(context, self.span);
                     visitor.block_indent = shape.indent;
                     visitor.last_pos = self.span.lo();
                     let inner_attrs = inner_attributes(&self.attrs);

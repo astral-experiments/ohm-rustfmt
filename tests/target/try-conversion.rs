@@ -26,3 +26,8 @@ fn issue1291() {
         )
     })?;
 }
+
+fn nested_try_chain() {
+    let x = outer().inner()?.0.next()?.value;
+    let y = thing??.method()?.0;
+}
