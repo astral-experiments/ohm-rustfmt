@@ -933,8 +933,12 @@ impl Plan {
             })
             .collect();
 
+        if changed.is_empty() {
+            return changed;
+        }
+
         loop {
-            let shared_files: BTreeSet<_> = self
+            let shared_files: HashSet<_> = self
                 .current
                 .packages
                 .values()
@@ -1136,7 +1140,10 @@ struct TargetGraph<'a, Paths> {
 }
 
 impl Snapshot {
-    fn source_digest(sources: &BTreeMap<String, SourceFingerprint>) -> io::Result<String> {
+    fn source_digest(
+        sources: &BTreeMap<String, SourceFingerprint>,
+        buffer: &mut [u8; 65_536],
+    ) -> io::Result<String> {
         let mut digest = Sha256::new();
         for path in sources.keys() {
             let mut source = blake3::Hasher::new();
@@ -1146,11 +1153,22 @@ impl Snapshot {
             options.read(true);
             #[cfg(unix)]
             options.custom_flags(rustix::fs::OFlags::NONBLOCK.bits() as i32);
-            let file = options.open(path)?;
+            let mut file = options.open(path)?;
             if !file.metadata()?.is_file() {
                 return Err(unsupported("the module is no longer a regular file"));
             }
-            source.update_reader(file)?;
+            // Keep the wide reads of Hasher::update_reader without zeroing
+            // its 64 KiB buffer for every source. Only hash the bytes read.
+            loop {
+                match file.read(buffer) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        source.update(&buffer[..n]);
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(error) => return Err(error),
+                }
+            }
             digest.update(source.finalize().as_bytes());
         }
         Ok(format!("{:x}", digest.finalize()))
@@ -1158,9 +1176,10 @@ impl Snapshot {
 
     #[cfg(test)]
     fn record_source_digests(&mut self) {
+        let mut buffer = [0; 65_536];
         for package in self.packages.values() {
             for (root, sources) in &package.targets {
-                if let Ok(digest) = Self::source_digest(sources) {
+                if let Ok(digest) = Self::source_digest(sources, &mut buffer) {
                     self.source_digests.insert(root.clone(), digest);
                 }
             }
@@ -1207,11 +1226,12 @@ impl Snapshot {
         }) {
             return false;
         }
+        let mut buffer = [0; 65_536];
         for (name, package) in &other.packages {
             for (root, sources) in &package.targets {
                 let previous = self.packages.get(name).and_then(|p| p.targets.get(root));
                 if previous == Some(sources)
-                    && !Self::source_digest(sources)
+                    && !Self::source_digest(sources, &mut buffer)
                         .is_ok_and(|digest| self.source_digests.get(root) == Some(&digest))
                 {
                     return false;
@@ -1325,23 +1345,26 @@ impl Snapshot {
                 .chain(root_only);
 
             configuration_directories.insert(target.package_root.as_path());
-            let mut sources = BTreeMap::new();
-            for path in paths {
-                let fingerprint = match file_fingerprints.entry(path) {
-                    Entry::Occupied(entry) => *entry.get(),
-                    Entry::Vacant(entry) => {
-                        let (_, metadata) = canonical_module_file(path)?;
-                        observed_probes
-                            .entry(path)
-                            .or_insert(ProbeObservation::File);
-                        *entry.insert(SourceFingerprint::from_metadata(&metadata)?)
+            // Both graphs provide sorted keys. Collect the maps in bulk so we
+            // don't search a growing tree for each path with a common prefix.
+            let sources = paths
+                .map(|path| {
+                    let fingerprint = match file_fingerprints.entry(path) {
+                        Entry::Occupied(entry) => *entry.get(),
+                        Entry::Vacant(entry) => {
+                            let (_, metadata) = canonical_module_file(path)?;
+                            observed_probes
+                                .entry(path)
+                                .or_insert(ProbeObservation::File);
+                            *entry.insert(SourceFingerprint::from_metadata(&metadata)?)
+                        }
+                    };
+                    if let Some(parent) = Path::new(path).parent() {
+                        configuration_directories.insert(parent);
                     }
-                };
-                if let Some(parent) = Path::new(path).parent() {
-                    configuration_directories.insert(parent);
-                }
-                sources.insert(path.to_owned(), fingerprint);
-            }
+                    Ok((path.to_owned(), fingerprint))
+                })
+                .collect::<io::Result<BTreeMap<_, _>>>()?;
             if !sources.contains_key(target_path) {
                 return Err(unsupported(
                     "an authoritative module graph omits its target root",
@@ -1357,16 +1380,18 @@ impl Snapshot {
                 ));
             }
 
-            let mut target_probes = BTreeMap::new();
-            if let Some(expected) = graph.probes {
-                for path in expected.keys() {
+            let target_probes = graph
+                .probes
+                .into_iter()
+                .flat_map(BTreeMap::keys)
+                .map(|path| {
                     let observation = match observed_probes.entry(path.as_str()) {
                         Entry::Occupied(entry) => entry.into_mut(),
                         Entry::Vacant(entry) => entry.insert(observe_module_probe(path)?),
                     };
-                    target_probes.insert(path.to_owned(), observation.clone());
-                }
-            }
+                    Ok((path.to_owned(), observation.clone()))
+                })
+                .collect::<io::Result<BTreeMap<_, _>>>()?;
 
             let package = packages
                 .entry(package_path)
@@ -1749,6 +1774,7 @@ fn collect_ancestor_configuration<'a>(
     visited: &mut HashSet<&'a Path>,
     configuration: &mut BTreeMap<String, String>,
 ) -> io::Result<()> {
+    let mut path = PathBuf::new();
     for ancestor in directory.ancestors() {
         if !visited.insert(ancestor) {
             break;
@@ -1763,7 +1789,9 @@ fn collect_ancestor_configuration<'a>(
             ".cargo/config",
             ".cargo/config.toml",
         ] {
-            collect_configuration_file(&ancestor.join(name), configuration)?;
+            ancestor.clone_into(&mut path);
+            path.push(name);
+            collect_configuration_file(&path, configuration)?;
         }
     }
 
@@ -1859,7 +1887,16 @@ fn collect_configuration_file(
     if !configuration.contains_key(&key) {
         let canonical_path = path.canonicalize()?;
         let canonical = path_string(&canonical_path)?;
-        let digest = hash_file_contents(&canonical_path)?;
+        // Like source files, lockfiles can be large. Hash their full contents
+        // with BLAKE3, keeping the SHA-256 identities shared with rustfmt for
+        // formatter settings. The prefix invalidates older SHA-256 lock entries.
+        let digest = if path.file_name().is_some_and(|name| name == "Cargo.lock") {
+            let mut digest = blake3::Hasher::new();
+            digest.update_reader(File::open(&canonical_path)?)?;
+            format!("blake3-{}", digest.finalize())
+        } else {
+            hash_file_contents(&canonical_path)?
+        };
         configuration.insert(key, format!("{canonical}:{digest}"));
     }
     Ok(true)
@@ -2499,6 +2536,28 @@ mod tests {
         assert!(lock_cache_file(&lock).is_err());
     }
 
+    #[test]
+    fn source_digest_hashes_only_the_bytes_read_from_each_file() -> io::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let mut sources = BTreeMap::new();
+        let mut expected = Sha256::new();
+        for (index, size) in [65_536, 1, 131_073, 0, 65_535].into_iter().enumerate() {
+            let path = directory.path().join(format!("{index}.rs"));
+            let bytes = vec![index as u8 + 1; size];
+            fs::write(&path, &bytes)?;
+            sources.insert(
+                path_string(&path)?,
+                SourceFingerprint::from_metadata(&fs::metadata(path)?)?,
+            );
+            expected.update(blake3::hash(&bytes).as_bytes());
+        }
+        assert_eq!(
+            Snapshot::source_digest(&sources, &mut [0xff; 65_536])?,
+            format!("{:x}", expected.finalize()),
+        );
+        Ok(())
+    }
+
     #[cfg(unix)]
     #[test]
     fn source_digest_rejects_a_module_replaced_by_a_fifo() -> io::Result<()> {
@@ -2517,7 +2576,7 @@ mod tests {
 
         let (send, receive) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            let _ = send.send(Snapshot::source_digest(&sources));
+            let _ = send.send(Snapshot::source_digest(&sources, &mut [0; 65_536]));
         });
         let result = receive
             .recv_timeout(std::time::Duration::from_secs(5))
@@ -3396,6 +3455,28 @@ mod tests {
             deletion.changed_targets(&[]),
             BTreeSet::from(["/workspace/first/src/lib.rs"])
         );
+    }
+
+    #[test]
+    fn lock_fingerprints_distinguish_edits_and_older_snapshots() -> io::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let lock = dir.path().join("Cargo.lock");
+        let identity = || -> io::Result<String> {
+            let mut captured = BTreeMap::new();
+            assert!(collect_configuration_file(&lock, &mut captured)?);
+            Ok(captured.into_values().next().unwrap())
+        };
+        fs::write(&lock, "version = 3")?;
+        let original = identity()?;
+        let canonical = path_string(&lock.canonicalize()?)?;
+        let old = format!("{canonical}:{}", hash_file_contents(&lock)?);
+        assert_ne!(original, old);
+        assert_eq!(original.rsplit_once(':').unwrap().0, canonical);
+        fs::write(&lock, "version = 4")?;
+        assert_ne!(identity()?, original);
+        fs::write(&lock, "version = 3")?;
+        assert_eq!(identity()?, original);
+        Ok(())
     }
 
     #[cfg(unix)]
